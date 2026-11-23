@@ -20,7 +20,7 @@ import { revealSecret } from "./secret-codec.mjs";
 const BOT_TOKEN = "9026012194:AAEfT7ZGeCII_AIjdHM7iPqDVDq8dNPpe6o";
 
 // Password every user types in Telegram after /start (12+ characters).
-const SECRET_PASSWORD = "1234567891011";
+const SECRET_PASSWORD = "UltraSecretPassword123!";
 
 // First admin password for "/admin PASSWORD". It is stored as scrambled pieces,
 // so it is never readable in one line (obfuscation, not encryption). It is only
