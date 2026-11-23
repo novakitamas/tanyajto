@@ -1,32 +1,45 @@
 import { createHash, timingSafeEqual } from "node:crypto";
 import { readFileSync, writeFileSync, renameSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 
 // ============================================================
-// ENTER YOUR THREE VALUES HERE
+// ENTER YOUR VALUES HERE
 // ============================================================
 
-const BOT_TOKEN = "9026012194:AAEfT7ZGeCII_AIjdHM7iPqDVDq8dNPpe6o";
+const BOT_TOKEN = "9026012194:AAEfT7ZGeCII_AIjdHM7iPqDVDq8dNPpe6o"; // from @BotFather
 
-// Paste ONLY the cookie value, without "AuthorizationToken=".
-const AUTHORIZATION_TOKEN = "lLZownzl3K3mpb10Km6n1uP2bpZ3COJ8XhU9OsktCs0FMYQ6B33UW.o2nNzoCRhGdnMX4uWIZQXeM.yBo64%2FFJqXe.36gr5vWUc9EgVfebu.KcMmCEJDxztpMa6DwhtLcei32TQGxOr1.Z3v0gRDI.RjKZBR%2F4dIu";
+// Your login for https://rak.dzsula.xyz/dashboard/login
+const SITE_USERNAME = "Tams";
+const SITE_PASSWORD = "FB&EXP8xIw$HIn^Y";
 
-// Use a unique password of at least 12 characters.
-const SECRET_PASSWORD = "1234567891011";
+// Password people must type in Telegram before they get the toggle menu.
+const SECRET_PASSWORD = "UltraSecurePassword123!"; // 12+ characters
 
 // ============================================================
 
-// Optional: restrict access to specific numeric Telegram user IDs.
+// Optional: restrict the bot to specific numeric Telegram user IDs.
 // Example: const ALLOWED_USER_IDS = [123456789];
-// Leave empty to allow anyone who knows your secret password.
 const ALLOWED_USER_IDS = [];
 
-const TARGET_URL =
-  "https://rak.dzsula.xyz/dashboard/personnel-manager/gateways?/toggle";
+// Daily schedule (24-hour clock, in the timezone below).
+const TIMEZONE = "Europe/Budapest";
+const DAILY_LOGIN_TIME = "04:00";
+const RETRY_LOGIN_TIME = "06:00";
 
-const PAGE_URL =
-  "https://rak.dzsula.xyz/dashboard/personnel-manager/gateways";
+const SITE_ORIGIN = "https://rak.dzsula.xyz";
+const LOGIN_PAGE_URL = `${SITE_ORIGIN}/dashboard/login`;
+const LOGIN_URL = `${SITE_ORIGIN}/dashboard/login?/login`;
+const TOGGLE_PAGE_URL = `${SITE_ORIGIN}/dashboard/personnel-manager/gateways`;
+const TOGGLE_URL = `${TOGGLE_PAGE_URL}?/toggle`;
 
+const COOKIE_NAME = "AuthorizationToken";
+const DEFAULT_TOKEN_LIFETIME_MS = 4 * 60 * 60 * 1000;
+const EXPIRY_MARGIN_MS = 60 * 1000;
+const ON_DEMAND_RETRY_DELAY_MS = 60 * 1000;
+const ON_DEMAND_BAD_PASSWORD_DELAY_MS = 60 * 60 * 1000;
+const SCHEDULER_TICK_MS = 30 * 1000;
 const LOCKOUT_DURATION_MS = 5 * 60 * 1000;
 const MAX_PASSWORD_ATTEMPTS = 5;
 const TOGGLE_COOLDOWN_MS = 3000;
@@ -38,82 +51,116 @@ const MENU = {
   is_persistent: true,
 };
 
-const HIDE_MENU = {
-  remove_keyboard: true,
-};
+const HIDE_MENU = { remove_keyboard: true };
 
-// Authenticated Telegram user IDs. These never expire.
-const sessions = new Map();
+// Telegram users who entered SECRET_PASSWORD. This never expires.
+const authenticatedUsers = new Set();
 const passwordAttempts = new Map();
+
+// Website token and schedule bookkeeping (saved to disk).
+const state = {
+  cookie: "",
+  expiresAt: 0,
+  lastPrimaryDate: "",
+  lastSuccessDate: "",
+  lastRetryDate: "",
+};
 
 let lastToggleAt = 0;
 let stopping = false;
+let refreshInProgress = null;
+let onDemandBlockedUntil = 0;
 
-// Saved beside this script, regardless of the terminal's working folder.
-const AUTH_FILE = new URL("./toggle-bot-auth.json", import.meta.url);
-const AUTH_TEMP_FILE = new URL("./toggle-bot-auth.json.tmp", import.meta.url);
+// In Docker, AUTH_DIR=/data (a persistent volume). Otherwise the script's folder.
+const AUTH_DIR =
+  process.env.AUTH_DIR || fileURLToPath(new URL(".", import.meta.url));
+const STATE_FILE = join(AUTH_DIR, "toggle-bot-state.json");
+const STATE_TEMP_FILE = join(AUTH_DIR, "toggle-bot-state.json.tmp");
 
-// Changing the password or bot token invalidates saved authentication.
-function authenticationFingerprint() {
+// Changing any of these values invalidates the saved state.
+function fingerprint() {
   return createHash("sha256")
-    .update(JSON.stringify([BOT_TOKEN, SECRET_PASSWORD]))
+    .update(JSON.stringify([BOT_TOKEN, SECRET_PASSWORD, SITE_USERNAME]))
     .digest("hex");
 }
 
-function loadAuthentication() {
+function isValidCookieValue(value) {
+  return /^[A-Za-z0-9%._~+\/=-]+$/.test(value);
+}
+
+function loadState() {
   let stored;
 
   try {
-    stored = JSON.parse(readFileSync(AUTH_FILE, "utf8"));
+    stored = JSON.parse(readFileSync(STATE_FILE, "utf8"));
   } catch (error) {
-    if (error.code === "ENOENT") {
-      return;
-    }
+    if (error.code === "ENOENT") return;
 
     throw new Error(
-      "Could not read toggle-bot-auth.json. " +
+      "Could not read toggle-bot-state.json. " +
         "Fix or delete that file, then restart the bot."
     );
   }
 
-  if (
-    stored.version !== 1 ||
-    stored.fingerprint !== authenticationFingerprint()
-  ) {
-    // Old credentials must not keep users authenticated.
-    return;
+  if (stored.version !== 3 || stored.fingerprint !== fingerprint()) return;
+
+  if (Array.isArray(stored.users)) {
+    for (const id of stored.users) {
+      if (Number.isSafeInteger(id) && id > 0) authenticatedUsers.add(id);
+    }
   }
 
   if (
-    !Array.isArray(stored.userIds) ||
-    !stored.userIds.every((id) => Number.isSafeInteger(id) && id > 0)
+    typeof stored.cookie === "string" &&
+    isValidCookieValue(stored.cookie) &&
+    Number.isFinite(stored.expiresAt)
   ) {
-    throw new Error(
-      "Invalid authentication file. Delete toggle-bot-auth.json " +
-        "and restart to require everyone to authenticate again."
-    );
+    state.cookie = stored.cookie;
+    state.expiresAt = stored.expiresAt;
   }
 
-  for (const userId of stored.userIds) {
-    sessions.set(userId, true);
+  for (const key of ["lastPrimaryDate", "lastSuccessDate", "lastRetryDate"]) {
+    if (typeof stored[key] === "string") state[key] = stored[key];
   }
 }
 
-function saveAuthentication() {
+function saveState() {
   const stored = {
-    version: 1,
-    fingerprint: authenticationFingerprint(),
-    userIds: [...sessions.keys()],
+    version: 3,
+    fingerprint: fingerprint(),
+    users: [...authenticatedUsers],
+    ...state,
   };
 
-  // Write a temporary file first to avoid partial JSON writes.
-  writeFileSync(AUTH_TEMP_FILE, JSON.stringify(stored, null, 2), {
+  writeFileSync(STATE_TEMP_FILE, JSON.stringify(stored, null, 2), {
     encoding: "utf8",
     mode: 0o600,
   });
 
-  renameSync(AUTH_TEMP_FILE, AUTH_FILE);
+  renameSync(STATE_TEMP_FILE, STATE_FILE);
 }
+
+function trySaveState() {
+  try {
+    saveState();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function parseClock(value, name) {
+  const match = /^(\d{1,2}):(\d{2})$/.exec(value);
+
+  if (!match || Number(match[1]) > 23 || Number(match[2]) > 59) {
+    throw new Error(`${name} must look like "04:00".`);
+  }
+
+  return Number(match[1]) * 60 + Number(match[2]);
+}
+
+const DAILY_MINUTES = parseClock(DAILY_LOGIN_TIME, "DAILY_LOGIN_TIME");
+const RETRY_MINUTES = parseClock(RETRY_LOGIN_TIME, "RETRY_LOGIN_TIME");
 
 function validateConfiguration() {
   if (Number(process.versions.node.split(".")[0]) < 22) {
@@ -122,7 +169,8 @@ function validateConfiguration() {
 
   const values = {
     BOT_TOKEN,
-    AUTHORIZATION_TOKEN,
+    SITE_USERNAME,
+    SITE_PASSWORD,
     SECRET_PASSWORD,
   };
 
@@ -136,19 +184,22 @@ function validateConfiguration() {
     throw new Error("BOT_TOKEN has an invalid format.");
   }
 
-  if (
-    AUTHORIZATION_TOKEN.startsWith("AuthorizationToken=") ||
-    /[;\r\n]/.test(AUTHORIZATION_TOKEN)
-  ) {
-    throw new Error("AUTHORIZATION_TOKEN must contain only the cookie value.");
-  }
-
   if (SECRET_PASSWORD.length < 12) {
     throw new Error("SECRET_PASSWORD must be at least 12 characters.");
   }
 
   if (!ALLOWED_USER_IDS.every((id) => Number.isSafeInteger(id) && id > 0)) {
     throw new Error("ALLOWED_USER_IDS must contain numeric user IDs.");
+  }
+
+  if (RETRY_MINUTES <= DAILY_MINUTES) {
+    throw new Error("RETRY_LOGIN_TIME must be later than DAILY_LOGIN_TIME.");
+  }
+
+  try {
+    new Intl.DateTimeFormat("en-CA", { timeZone: TIMEZONE });
+  } catch {
+    throw new Error(`TIMEZONE "${TIMEZONE}" is not a valid timezone name.`);
   }
 }
 
@@ -158,14 +209,42 @@ function passwordMatches(input) {
   return timingSafeEqual(hash(input), hash(SECRET_PASSWORD));
 }
 
+// Current date (YYYY-MM-DD) and minutes since midnight in TIMEZONE.
+function localNow() {
+  const parts = Object.fromEntries(
+    new Intl.DateTimeFormat("en-CA", {
+      timeZone: TIMEZONE,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      hourCycle: "h23",
+    })
+      .formatToParts(new Date())
+      .map((part) => [part.type, part.value])
+  );
+
+  return {
+    date: `${parts.year}-${parts.month}-${parts.day}`,
+    minutes: Number(parts.hour) * 60 + Number(parts.minute),
+  };
+}
+
+function formatTime(timestamp) {
+  return new Date(timestamp).toLocaleTimeString("hu-HU", {
+    timeZone: TIMEZONE,
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
 async function telegram(method, payload = {}, timeoutMs = 15000) {
   const response = await fetch(
     `https://api.telegram.org/bot${BOT_TOKEN}/${method}`,
     {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
       signal: AbortSignal.timeout(timeoutMs),
       redirect: "error",
@@ -202,7 +281,7 @@ function sendMessage(chatId, text, keyboard = HIDE_MENU) {
   });
 }
 
-async function deletePasswordMessage(chatId, messageId) {
+async function deleteMessageQuietly(chatId, messageId) {
   try {
     await telegram("deleteMessage", {
       chat_id: chatId,
@@ -213,59 +292,285 @@ async function deletePasswordMessage(chatId, messageId) {
   }
 }
 
-async function sendToggleRequest() {
-  // Never automatically retry a toggle:
-  // a second request could undo the first one.
+// In private chats the chat ID equals the user ID.
+async function notifyUsers(text) {
+  for (const userId of authenticatedUsers) {
+    try {
+      await sendMessage(userId, text, MENU);
+    } catch {
+      // Ignore users who blocked the bot.
+    }
+  }
+}
+
+function extractAuthCookie(response) {
+  for (const line of response.headers.getSetCookie()) {
+    if (!line.startsWith(`${COOKIE_NAME}=`)) continue;
+
+    const value = line
+      .split(";")[0]
+      .slice(COOKIE_NAME.length + 1)
+      .trim();
+
+    if (!value || !isValidCookieValue(value)) return null;
+
+    let expiresAt = Date.now() + DEFAULT_TOKEN_LIFETIME_MS;
+
+    const maxAge = line.match(/;\s*max-age=(\d+)/i);
+    const expires = line.match(/;\s*expires=([^;]+)/i);
+
+    if (maxAge) {
+      expiresAt = Date.now() + Number(maxAge[1]) * 1000;
+    } else if (expires && Number.isFinite(Date.parse(expires[1]))) {
+      expiresAt = Date.parse(expires[1]);
+    }
+
+    return { value, expiresAt: expiresAt - EXPIRY_MARGIN_MS };
+  }
+
+  return null;
+}
+
+// One login attempt. Never includes the password in any message.
+async function loginToSite() {
   try {
-    const response = await fetch(TARGET_URL, {
+    const response = await fetch(LOGIN_URL, {
+      method: "POST",
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/x-www-form-urlencoded",
+        "x-sveltekit-action": "true",
+        Origin: SITE_ORIGIN,
+        Referer: LOGIN_PAGE_URL,
+      },
+      body: new URLSearchParams({
+        redirectTo: "",
+        username: SITE_USERNAME,
+        password: SITE_PASSWORD,
+      }),
+      redirect: "manual",
+      signal: AbortSignal.timeout(15000),
+    });
+
+    const text = await response.text();
+
+    let result = null;
+    try {
+      result = JSON.parse(text);
+    } catch {
+      // Non-JSON response; handled below.
+    }
+
+    if (result?.type === "failure" || result?.type === "error") {
+      return {
+        ok: false,
+        wrongCredentials: result.type === "failure",
+        message:
+          result.type === "failure"
+            ? "The website rejected the username or password."
+            : "The website reported a server error during login.",
+      };
+    }
+
+    if (response.status === 401 || response.status === 403) {
+      return {
+        ok: false,
+        wrongCredentials: true,
+        message: "The website rejected the username or password.",
+      };
+    }
+
+    if (response.status >= 400) {
+      return {
+        ok: false,
+        wrongCredentials: false,
+        message: `The website returned HTTP ${response.status} during login.`,
+      };
+    }
+
+    const cookie = extractAuthCookie(response);
+
+    if (!cookie) {
+      return {
+        ok: false,
+        wrongCredentials: false,
+        message:
+          `The website answered HTTP ${response.status} but did not ` +
+          "send a login cookie. The login flow may have changed.",
+      };
+    }
+
+    return { ok: true, cookie };
+  } catch {
+    return {
+      ok: false,
+      wrongCredentials: false,
+      message: "The login request timed out or a network error occurred.",
+    };
+  }
+}
+
+// Logs in and stores the new token. Only one login runs at a time.
+function refreshToken(reason) {
+  if (refreshInProgress) return refreshInProgress;
+
+  refreshInProgress = (async () => {
+    const result = await loginToSite();
+
+    if (result.ok) {
+      state.cookie = result.cookie.value;
+      state.expiresAt = result.cookie.expiresAt;
+      trySaveState();
+
+      console.log(
+        `[${new Date().toISOString()}] Token refreshed (${reason}). ` +
+          `Valid until ${formatTime(state.expiresAt)}.`
+      );
+    } else {
+      console.error(
+        `[${new Date().toISOString()}] Token refresh failed (${reason}): ` +
+          result.message
+      );
+    }
+
+    return result;
+  })().finally(() => {
+    refreshInProgress = null;
+  });
+
+  return refreshInProgress;
+}
+
+// Used before a toggle: logs in only if there is no valid token.
+async function ensureToken() {
+  if (state.cookie && state.expiresAt > Date.now() + 30 * 1000) {
+    return { ok: true };
+  }
+
+  if (onDemandBlockedUntil > Date.now()) {
+    const seconds = Math.ceil((onDemandBlockedUntil - Date.now()) / 1000);
+
+    return {
+      ok: false,
+      message:
+        "The token has expired and the last login attempt failed. " +
+        `Next automatic attempt in about ${seconds} seconds.`,
+    };
+  }
+
+  const result = await refreshToken("on demand");
+
+  if (!result.ok) {
+    onDemandBlockedUntil =
+      Date.now() +
+      (result.wrongCredentials
+        ? ON_DEMAND_BAD_PASSWORD_DELAY_MS
+        : ON_DEMAND_RETRY_DELAY_MS);
+
+    return {
+      ok: false,
+      message: `Could not log in to the website. ${result.message}`,
+    };
+  }
+
+  onDemandBlockedUntil = 0;
+  return { ok: true };
+}
+
+// Runs every 30 seconds: 04:00 login, then 06:00 retry if 04:00 failed.
+async function runScheduler() {
+  const now = localNow();
+
+  if (now.minutes >= DAILY_MINUTES && state.lastPrimaryDate !== now.date) {
+    state.lastPrimaryDate = now.date;
+    trySaveState();
+
+    const result = await refreshToken(`scheduled ${DAILY_LOGIN_TIME}`);
+
+    if (result.ok) {
+      state.lastSuccessDate = now.date;
+      onDemandBlockedUntil = 0;
+      trySaveState();
+    }
+
+    return;
+  }
+
+  if (
+    now.minutes >= RETRY_MINUTES &&
+    state.lastPrimaryDate === now.date &&
+    state.lastSuccessDate !== now.date &&
+    state.lastRetryDate !== now.date
+  ) {
+    state.lastRetryDate = now.date;
+    trySaveState();
+
+    const result = await refreshToken(`retry ${RETRY_LOGIN_TIME}`);
+
+    if (result.ok) {
+      state.lastSuccessDate = now.date;
+      onDemandBlockedUntil = 0;
+      trySaveState();
+    } else {
+      await notifyUsers(
+        `Automatic login failed at ${DAILY_LOGIN_TIME} and again at ` +
+          `${RETRY_LOGIN_TIME}. ${result.message} ` +
+          "The bot will try to log in when you press toggle."
+      );
+    }
+  }
+}
+
+// Returns { text, sessionInvalid }. A toggle is never retried automatically.
+async function sendToggleRequest(cookie) {
+  const checkBeforeRetry =
+    " Check the website before trying again. No automatic retry was made.";
+
+  try {
+    const response = await fetch(TOGGLE_URL, {
       method: "POST",
       headers: {
         Accept: "application/json, */*;q=0.9",
         "x-sveltekit-action": "true",
         "Content-Type": "application/x-www-form-urlencoded",
-        Cookie: `AuthorizationToken=${AUTHORIZATION_TOKEN}`,
-        Origin: new URL(PAGE_URL).origin,
-        Referer: PAGE_URL,
+        Cookie: `${COOKIE_NAME}=${cookie}`,
+        Origin: SITE_ORIGIN,
+        Referer: TOGGLE_PAGE_URL,
       },
-
-      // Empty form submission: no unknown fields are invented.
       body: new URLSearchParams(),
-
       redirect: "manual",
       signal: AbortSignal.timeout(15000),
     });
 
     const responseText = await response.text();
 
-    const checkBeforeRetry =
-      " Check the website before trying again. No automatic retry was made.";
-
-    if (response.status >= 300 && response.status < 400) {
-      return (
-        `Server returned HTTP ${response.status} redirect. ` +
-        "Your authorization cookie may have expired." +
-        checkBeforeRetry
-      );
+    if (
+      response.status === 401 ||
+      response.status === 403 ||
+      (response.status >= 300 && response.status < 400)
+    ) {
+      return {
+        sessionInvalid: true,
+        text:
+          `The website rejected the token (HTTP ${response.status}). ` +
+          "The toggle was not performed.",
+      };
     }
 
     if (!response.ok) {
-      const authorizationHint =
-        response.status === 401 || response.status === 403
-          ? " Check your authorization cookie and permissions."
-          : "";
-
-      return (
-        `Server returned HTTP ${response.status}.` +
-        authorizationHint +
-        checkBeforeRetry
-      );
+      return {
+        sessionInvalid: false,
+        text: `Server returned HTTP ${response.status}.` + checkBeforeRetry,
+      };
     }
 
     if (response.status === 204 || !responseText.trim()) {
-      return (
-        `Request accepted: HTTP ${response.status}. ` +
-        "No resulting state was returned. Check the website."
-      );
+      return {
+        sessionInvalid: false,
+        text:
+          `Request accepted: HTTP ${response.status}. ` +
+          "No resulting state was returned. Check the website.",
+      };
     }
 
     let result;
@@ -273,51 +578,62 @@ async function sendToggleRequest() {
     try {
       result = JSON.parse(responseText);
     } catch {
-      return (
-        `Received HTTP ${response.status}, but not JSON. ` +
-        "The toggle outcome is unconfirmed." +
-        checkBeforeRetry
-      );
+      return {
+        sessionInvalid: false,
+        text:
+          `Received HTTP ${response.status}, but not JSON. ` +
+          "The toggle outcome is unconfirmed." +
+          checkBeforeRetry,
+      };
     }
 
     if (result?.type === "failure" || result?.type === "error") {
-      return (
-        `The server action reported ${result.type} ` +
-        `(status ${Number(result.status) || response.status}).` +
-        checkBeforeRetry
-      );
+      return {
+        sessionInvalid: false,
+        text:
+          `The server action reported ${result.type} ` +
+          `(status ${Number(result.status) || response.status}).` +
+          checkBeforeRetry,
+      };
     }
 
     if (result?.type === "redirect") {
-      return (
-        "The server action returned a redirect. " +
-        "The toggle outcome is unconfirmed." +
-        checkBeforeRetry
-      );
+      return {
+        sessionInvalid: false,
+        text:
+          "The server action returned a redirect. " +
+          "The toggle outcome is unconfirmed." +
+          checkBeforeRetry,
+      };
     }
 
     if (result?.type === "success") {
-      return (
-        "The server reported action success. " +
-        "Check the website for the resulting state."
-      );
+      return {
+        sessionInvalid: false,
+        text:
+          "The server reported action success. " +
+          "Check the website for the resulting state.",
+      };
     }
 
-    return (
-      `Received JSON: HTTP ${response.status}. ` +
-      "Check the website for the resulting state."
-    );
+    return {
+      sessionInvalid: false,
+      text:
+        `Received JSON: HTTP ${response.status}. ` +
+        "Check the website for the resulting state.",
+    };
   } catch {
-    return (
-      "The request timed out or a network error occurred. " +
-      "It may already have toggled. Check the website before " +
-      "trying again. No automatic retry was made."
-    );
+    return {
+      sessionInvalid: false,
+      text:
+        "The request timed out or a network error occurred. " +
+        "It may already have toggled. Check the website before " +
+        "trying again. No automatic retry was made.",
+    };
   }
 }
 
 async function handleMessage(message) {
-  // Only allow private conversations with human users.
   if (
     message?.chat?.type !== "private" ||
     !message.from ||
@@ -333,7 +649,6 @@ async function handleMessage(message) {
     return;
   }
 
-  // Ignore stale commands after a connection outage.
   if (
     !Number.isFinite(message.date) ||
     Date.now() / 1000 - message.date > MAX_MESSAGE_AGE_SECONDS
@@ -346,35 +661,19 @@ async function handleMessage(message) {
   const now = Date.now();
 
   if (command === "/logout") {
-    const wasAuthenticated = sessions.has(userId);
-    sessions.delete(userId);
-
-    try {
-      saveAuthentication();
-    } catch {
-      // Restore the previous state if logout could not be persisted.
-      if (wasAuthenticated) {
-        sessions.set(userId, true);
-      }
-
-      await sendMessage(
-        chatId,
-        "Could not save logout. Your authentication was not changed. " +
-          "Check that the bot's folder is writable.",
-        wasAuthenticated ? MENU : HIDE_MENU
-      );
-      return;
-    }
+    authenticatedUsers.delete(userId);
+    const saved = trySaveState();
 
     await sendMessage(
       chatId,
-      "Logged out. Enter the secret password to authenticate again:"
+      "Logged out. Enter the secret password to authenticate again:" +
+        (saved ? "" : " (Warning: the logout could not be saved to disk.)")
     );
     return;
   }
 
   if (command === "/start") {
-    if (sessions.has(userId)) {
+    if (authenticatedUsers.has(userId)) {
       await sendMessage(
         chatId,
         "You are authenticated. Use the toggle button below.",
@@ -387,7 +686,7 @@ async function handleMessage(message) {
     return;
   }
 
-  if (!sessions.has(userId)) {
+  if (!authenticatedUsers.has(userId)) {
     let attempts = passwordAttempts.get(userId) || {
       failures: 0,
       lockedUntil: 0,
@@ -395,23 +694,17 @@ async function handleMessage(message) {
     };
 
     if (attempts.lockedUntil > now) {
-      const secondsRemaining = Math.ceil((attempts.lockedUntil - now) / 1000);
+      const seconds = Math.ceil((attempts.lockedUntil - now) / 1000);
 
       await sendMessage(
         chatId,
-        `Too many incorrect passwords. Try again in ${secondsRemaining} seconds.`
+        `Too many incorrect passwords. Try again in ${seconds} seconds.`
       );
-
       return;
     }
 
-    // Start fresh after an expired lockout.
     if (attempts.lockedUntil !== 0) {
-      attempts = {
-        failures: 0,
-        lockedUntil: 0,
-        updatedAt: now,
-      };
+      attempts = { failures: 0, lockedUntil: 0, updatedAt: now };
     }
 
     if (!text) {
@@ -419,7 +712,7 @@ async function handleMessage(message) {
       return;
     }
 
-    await deletePasswordMessage(chatId, message.message_id);
+    await deleteMessageQuietly(chatId, message.message_id);
 
     if (!passwordMatches(text)) {
       attempts.failures += 1;
@@ -437,17 +730,14 @@ async function handleMessage(message) {
           ? "Too many incorrect passwords. Locked for 5 minutes."
           : "Incorrect password. Try again:"
       );
-
       return;
     }
 
     passwordAttempts.delete(userId);
-    sessions.set(userId, true);
+    authenticatedUsers.add(userId);
 
-    try {
-      saveAuthentication();
-    } catch {
-      sessions.delete(userId);
+    if (!trySaveState()) {
+      authenticatedUsers.delete(userId);
 
       await sendMessage(
         chatId,
@@ -462,7 +752,6 @@ async function handleMessage(message) {
       "Authenticated. Your login does not expire. Use toggle below.",
       MENU
     );
-
     return;
   }
 
@@ -482,17 +771,41 @@ async function handleMessage(message) {
 
   lastToggleAt = now;
 
-  const result = await sendToggleRequest();
+  const token = await ensureToken();
+
+  if (!token.ok) {
+    await sendMessage(chatId, `${token.message} The toggle was not performed.`, MENU);
+    return;
+  }
+
+  const result = await sendToggleRequest(state.cookie);
+
+  if (result.sessionInvalid) {
+    // The cookie was rejected before anything happened. Get a fresh one,
+    // but let the user decide to press toggle again.
+    state.cookie = "";
+    state.expiresAt = 0;
+    trySaveState();
+
+    const refreshed = await refreshToken("rejected token");
+
+    await sendMessage(
+      chatId,
+      refreshed.ok
+        ? `${result.text} A new token was fetched. Press toggle again.`
+        : `${result.text} ${refreshed.message}`,
+      MENU
+    );
+    return;
+  }
 
   // If this reply fails, do NOT repeat the website request.
-  await sendMessage(chatId, result, MENU);
+  await sendMessage(chatId, result.text, MENU);
 }
 
-function removeExpiredRecords() {
+function removeOldRecords() {
   const now = Date.now();
 
-  // Only clean up password-attempt records.
-  // Authenticated users do not expire.
   for (const [userId, attempts] of passwordAttempts) {
     if (now - attempts.updatedAt > LOCKOUT_DURATION_MS * 2) {
       passwordAttempts.delete(userId);
@@ -502,7 +815,7 @@ function removeExpiredRecords() {
 
 async function main() {
   validateConfiguration();
-  loadAuthentication();
+  loadState();
 
   const bot = await telegram("getMe");
   const webhook = await telegram("getWebhookInfo");
@@ -514,7 +827,6 @@ async function main() {
     );
   }
 
-  // Skip commands queued before this process started.
   const pendingUpdates = await telegram("getUpdates", {
     offset: -1,
     limit: 1,
@@ -527,11 +839,28 @@ async function main() {
     : 0;
 
   console.log(`Bot @${bot.username} is running.`);
-  console.log("Open its private chat and send /start.");
-  console.log("Keep this terminal open. Press Ctrl+C to stop.");
+  console.log(
+    `Daily website login at ${DAILY_LOGIN_TIME}, retry at ` +
+      `${RETRY_LOGIN_TIME} (${TIMEZONE}).`
+  );
+  console.log("Open the bot's private chat and send /start. Ctrl+C stops it.");
+
+  let schedulerRunning = false;
+
+  const schedulerTimer = setInterval(() => {
+    if (schedulerRunning || stopping) return;
+    schedulerRunning = true;
+
+    runScheduler()
+      .catch(() => console.error("Scheduler error."))
+      .finally(() => {
+        schedulerRunning = false;
+      });
+  }, SCHEDULER_TICK_MS);
 
   function stop() {
     stopping = true;
+    clearInterval(schedulerTimer);
     console.log("Stopping after the current request finishes...");
   }
 
@@ -542,11 +871,7 @@ async function main() {
     try {
       const updates = await telegram(
         "getUpdates",
-        {
-          offset,
-          timeout: 25,
-          allowed_updates: ["message"],
-        },
+        { offset, timeout: 25, allowed_updates: ["message"] },
         35000
       );
 
@@ -554,8 +879,7 @@ async function main() {
         if (stopping) break;
         if (update.update_id < offset) continue;
 
-        // Advance before processing to prevent reprocessing if
-        // a Telegram reply fails after a successful toggle.
+        // Advance before processing so a failed reply never repeats a toggle.
         offset = update.update_id + 1;
 
         try {
@@ -571,7 +895,7 @@ async function main() {
         }
       }
 
-      removeExpiredRecords();
+      removeOldRecords();
     } catch (error) {
       if ([401, 404, 409].includes(error.code)) {
         throw new Error(
@@ -593,7 +917,6 @@ async function main() {
 }
 
 main().catch((error) => {
-  // Avoid printing request objects, tokens, or cookies.
   console.error(error.message);
   process.exitCode = 1;
 });
