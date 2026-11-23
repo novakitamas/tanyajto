@@ -5,7 +5,7 @@ import { encodeSecret, revealSecret } from "./secret-codec.mjs";
 // Usage: node encode-secret.mjs
 // Type or paste a secret (it is not shown). The script prints the lines to
 // paste into toggle-bot.mjs, for example:
-//   const BOT_TOKEN = revealSecret([ ... ]);
+//   const INITIAL_ADMIN_PASSWORD = revealSecret([ ... ]);
 
 let muted = false;
 
