@@ -10,20 +10,42 @@ import { readFileSync, writeFileSync, renameSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
+import { revealSecret } from "./secret-codec.mjs";
 
 // ============================================================
 // SETTINGS
 // ============================================================
+// The secrets below are stored as scrambled pieces, so they are never
+// readable in one line. This is obfuscation, not encryption: to change a
+// value, run "node encode-secret.mjs" and paste the printed block here.
 
-const BOT_TOKEN = "9026012194:AAEfT7ZGeCII_AIjdHM7iPqDVDq8dNPpe6o";
+// Telegram bot token (from @BotFather).
+const BOT_TOKEN = revealSecret([
+  "qxD+OJ1c",
+  "EP7akI56",
+  "z2qiKfy7",
+  "JfzcgQuz",
+  "LwqJwzh0",
+  "tF9GfEou",
+  "1qzkvSSq",
+  "mjhRwg==",
+]);
 
 // Password every user types in Telegram after /start (12+ characters).
-const SECRET_PASSWORD = "1234567891011";
+const SECRET_PASSWORD = revealSecret([
+  "oxL/Ophb",
+  "FffalYQK",
+  "vw==",
+]);
 
 // First admin password for "/admin PASSWORD". It is only used to create the
 // saved (hashed) admin password on the first start. After that, change the
 // password in Telegram with "/adminp CURRENT NEW".
-const INITIAL_ADMIN_PASSWORD = "piFc03elUtpLxdqc";
+const INITIAL_ADMIN_PASSWORD = revealSecret([
+  "4kmKbZ1e",
+  "R6O20MR3",
+  "9ku1Hg==",
+]);
 
 // ============================================================
 
