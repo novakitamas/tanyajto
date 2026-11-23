@@ -36,8 +36,9 @@ const INITIAL_ADMIN_PASSWORD = revealSecret([
 
 // ============================================================
 
-// Optional: restrict the bot to specific numeric Telegram user IDs.
+// Optional: restrict access to specific numeric Telegram user IDs.
 // Example: const ALLOWED_USER_IDS = [123456789];
+// Leave empty to allow anyone who knows your secret password.
 const ALLOWED_USER_IDS = [];
 
 const SITE_ORIGIN = "https://rak.dzsula.xyz";
@@ -177,7 +178,7 @@ function secretMatches(input) {
 // Changing BOT_TOKEN or SECRET_PASSWORD logs out normal users.
 function usersFingerprint() {
   return createHash("sha256")
-    .update(JSON.stringify([BOT_TOKEN, SECRET_PASSWORD, SITE_USERNAME]))
+    .update(JSON.stringify([BOT_TOKEN, SECRET_PASSWORD]))
     .digest("hex");
 }
 
@@ -274,28 +275,6 @@ function mutate(change) {
   }
 }
 
-function trySaveState() {
-  try {
-    saveState();
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-function parseClock(value, name) {
-  const match = /^(\d{1,2}):(\d{2})$/.exec(value);
-
-  if (!match || Number(match[1]) > 23 || Number(match[2]) > 59) {
-    throw new Error(`${name} must look like "04:00".`);
-  }
-
-  return Number(match[1]) * 60 + Number(match[2]);
-}
-
-const DAILY_MINUTES = parseClock(DAILY_LOGIN_TIME, "DAILY_LOGIN_TIME");
-const RETRY_MINUTES = parseClock(RETRY_LOGIN_TIME, "RETRY_LOGIN_TIME");
-
 function validateConfiguration() {
   if (Number(process.versions.node.split(".")[0]) < 22) {
     throw new Error("Please install Node.js 22 or newer.");
@@ -311,16 +290,6 @@ function validateConfiguration() {
 
   if (!ALLOWED_USER_IDS.every((id) => Number.isSafeInteger(id) && id > 0)) {
     throw new Error("ALLOWED_USER_IDS must contain numeric user IDs.");
-  }
-
-  if (RETRY_MINUTES <= DAILY_MINUTES) {
-    throw new Error("RETRY_LOGIN_TIME must be later than DAILY_LOGIN_TIME.");
-  }
-
-  try {
-    new Intl.DateTimeFormat("en-CA", { timeZone: TIMEZONE });
-  } catch {
-    throw new Error(`TIMEZONE "${TIMEZONE}" is not a valid timezone name.`);
   }
 }
 
@@ -1489,7 +1458,7 @@ async function handleMessage(message) {
   await sendMessage(chatId, "Unknown command. Send /help.", MENU);
 }
 
-function removeOldRecords() {
+function removeExpiredRecords() {
   const now = Date.now();
 
   for (const map of [passwordAttempts, adminAttempts]) {
@@ -1516,6 +1485,7 @@ async function main() {
     );
   }
 
+  // Skip commands queued before this process started.
   const pendingUpdates = await telegram("getUpdates", {
     offset: -1,
     limit: 1,
@@ -1528,28 +1498,11 @@ async function main() {
     : 0;
 
   console.log(`Bot @${bot.username} is running.`);
-  console.log(
-    `Daily website login at ${DAILY_LOGIN_TIME}, retry at ` +
-      `${RETRY_LOGIN_TIME} (${TIMEZONE}).`
-  );
-  console.log("Open the bot's private chat and send /start. Ctrl+C stops it.");
-
-  let schedulerRunning = false;
-
-  const schedulerTimer = setInterval(() => {
-    if (schedulerRunning || stopping) return;
-    schedulerRunning = true;
-
-    runScheduler()
-      .catch(() => console.error("Scheduler error."))
-      .finally(() => {
-        schedulerRunning = false;
-      });
-  }, SCHEDULER_TICK_MS);
+  console.log("Open its private chat and send /start.");
+  console.log("Keep this terminal open. Press Ctrl+C to stop.");
 
   function stop() {
     stopping = true;
-    clearInterval(schedulerTimer);
     console.log("Stopping after the current request finishes...");
   }
 
@@ -1590,7 +1543,7 @@ async function main() {
         }
       }
 
-      removeOldRecords();
+      removeExpiredRecords();
     } catch (error) {
       if ([401, 404, 409].includes(error.code)) {
         throw new Error(
