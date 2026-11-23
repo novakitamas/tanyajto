@@ -1024,8 +1024,7 @@ async function handleSecretPassword(message, text, now) {
 
   await sendMessage(
     chatId,
-    "Authenticated. Your login does not expire. Use toggle below. " +
-      "Send /help for commands.",
+    "Authenticated. Your login does not expire. Use toggle below. ",
     MENU
   );
 }
