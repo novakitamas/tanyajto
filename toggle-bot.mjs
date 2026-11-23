@@ -1,21 +1,38 @@
-import { createHash, timingSafeEqual } from "node:crypto";
+import {
+  createCipheriv,
+  createDecipheriv,
+  createHash,
+  randomBytes,
+  scryptSync,
+  timingSafeEqual,
+} from "node:crypto";
 import { readFileSync, writeFileSync, renameSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
+import { revealSecret } from "./secret-codec.mjs";
 
 // ============================================================
-// ENTER YOUR VALUES HERE
+// SETTINGS
 // ============================================================
 
-const BOT_TOKEN = "9026012194:AAEfT7ZGeCII_AIjdHM7iPqDVDq8dNPpe6o"; // from @BotFather
+// Telegram bot token (from @BotFather).
+const BOT_TOKEN = "9026012194:AAEfT7ZGeCII_AIjdHM7iPqDVDq8dNPpe6o";
 
-// Your login for https://rak.dzsula.xyz/dashboard/login
-const SITE_USERNAME = "Tams";
-const SITE_PASSWORD = "FB&EXP8xIw$HIn^Y";
+// Password every user types in Telegram after /start (12+ characters).
+const SECRET_PASSWORD = "1234567891011";
 
-// Password people must type in Telegram before they get the toggle menu.
-const SECRET_PASSWORD = "UltraSecurePassword123!"; // 12+ characters
+// First admin password for "/admin PASSWORD". It is stored as scrambled pieces,
+// so it is never readable in one line (obfuscation, not encryption). It is only
+// used to create the saved (hashed) admin password on the first start. After
+// that, change the password in Telegram with "/adminp CURRENT NEW".
+// To use a different starting password, run "node encode-secret.mjs" and paste
+// the printed block here.
+const INITIAL_ADMIN_PASSWORD = revealSecret([
+  "4kmKbZ1e",
+  "R6O20MR3",
+  "9ku1Hg==",
+]);
 
 // ============================================================
 
@@ -23,23 +40,18 @@ const SECRET_PASSWORD = "UltraSecurePassword123!"; // 12+ characters
 // Example: const ALLOWED_USER_IDS = [123456789];
 const ALLOWED_USER_IDS = [];
 
-// Daily schedule (24-hour clock, in the timezone below).
-const TIMEZONE = "Europe/Budapest";
-const DAILY_LOGIN_TIME = "04:00";
-const RETRY_LOGIN_TIME = "06:00";
-
 const SITE_ORIGIN = "https://rak.dzsula.xyz";
 const LOGIN_PAGE_URL = `${SITE_ORIGIN}/dashboard/login`;
-const LOGIN_URL = `${SITE_ORIGIN}/dashboard/login?/login`;
-const TOGGLE_PAGE_URL = `${SITE_ORIGIN}/dashboard/personnel-manager/gateways`;
-const TOGGLE_URL = `${TOGGLE_PAGE_URL}?/toggle`;
+const LOGIN_URL = `${LOGIN_PAGE_URL}?/login`;
+const PAGE_URL = `${SITE_ORIGIN}/dashboard/personnel-manager/gateways`;
+const TARGET_URL = `${PAGE_URL}?/toggle`;
 
 const COOKIE_NAME = "AuthorizationToken";
 const DEFAULT_TOKEN_LIFETIME_MS = 4 * 60 * 60 * 1000;
 const EXPIRY_MARGIN_MS = 60 * 1000;
-const ON_DEMAND_RETRY_DELAY_MS = 60 * 1000;
-const ON_DEMAND_BAD_PASSWORD_DELAY_MS = 60 * 60 * 1000;
-const SCHEDULER_TICK_MS = 30 * 1000;
+const RETRY_DELAY_MS = 60 * 1000;
+const BAD_PASSWORD_DELAY_MS = 60 * 60 * 1000;
+const PENDING_TIMEOUT_MS = 5 * 60 * 1000;
 const LOCKOUT_DURATION_MS = 5 * 60 * 1000;
 const MAX_PASSWORD_ATTEMPTS = 5;
 const TOGGLE_COOLDOWN_MS = 3000;
@@ -53,91 +65,213 @@ const MENU = {
 
 const HIDE_MENU = { remove_keyboard: true };
 
-// Telegram users who entered SECRET_PASSWORD. This never expires.
-const authenticatedUsers = new Set();
-const passwordAttempts = new Map();
+const KNOWN_COMMANDS = new Set([
+  "start", "admin", "logout", "help", "token", "switch",
+  "accounts", "adminp", "cancel",
+]);
 
-// Website token and schedule bookkeeping (saved to disk).
-const state = {
-  cookie: "",
-  expiresAt: 0,
-  lastPrimaryDate: "",
-  lastSuccessDate: "",
-  lastRetryDate: "",
-};
+// In-memory state (never saved).
+const passwordAttempts = new Map();
+const adminAttempts = new Map();
+const pending = new Map(); // userId -> { type, username, startedAt }
+const accountSessions = new Map(); // account id -> { cookie, expiresAt }
+const accountBlockedUntil = new Map();
+const accountLogins = new Map();
 
 let lastToggleAt = 0;
 let stopping = false;
-let refreshInProgress = null;
-let onDemandBlockedUntil = 0;
 
-// In Docker, AUTH_DIR=/data (a persistent volume). Otherwise the script's folder.
+// Saved state. Passwords and tokens are stored encrypted (AES-256-GCM)
+// with a random key kept in toggle-bot.key. Keep both files private.
 const AUTH_DIR =
   process.env.AUTH_DIR || fileURLToPath(new URL(".", import.meta.url));
-const STATE_FILE = join(AUTH_DIR, "toggle-bot-state.json");
-const STATE_TEMP_FILE = join(AUTH_DIR, "toggle-bot-state.json.tmp");
+const DATA_FILE = join(AUTH_DIR, "toggle-bot-data.json");
+const DATA_TEMP_FILE = join(AUTH_DIR, "toggle-bot-data.json.tmp");
+const KEY_FILE = join(AUTH_DIR, "toggle-bot.key");
+const LEGACY_AUTH_FILE = join(AUTH_DIR, "toggle-bot-auth.json");
 
-// Changing any of these values invalidates the saved state.
-function fingerprint() {
+const data = {
+  admins: [],
+  users: [],
+  modes: {},
+  userTokens: {},
+  accounts: [],
+  adminPasswordHash: "",
+};
+
+let encryptionKey = null;
+
+function getKey() {
+  if (encryptionKey) return encryptionKey;
+
+  try {
+    const hex = readFileSync(KEY_FILE, "utf8").trim();
+    if (!/^[0-9a-f]{64}$/.test(hex)) throw new Error("invalid");
+    encryptionKey = Buffer.from(hex, "hex");
+  } catch (error) {
+    if (error.code !== "ENOENT") {
+      throw new Error(
+        "toggle-bot.key is invalid. Restore it, or delete it " +
+          "(saved accounts and tokens then become unreadable)."
+      );
+    }
+
+    const key = randomBytes(32);
+    writeFileSync(KEY_FILE, key.toString("hex"), {
+      encoding: "utf8",
+      mode: 0o600,
+      flag: "wx",
+    });
+    encryptionKey = key;
+  }
+
+  return encryptionKey;
+}
+
+function encryptText(plain) {
+  const iv = randomBytes(12);
+  const cipher = createCipheriv("aes-256-gcm", getKey(), iv);
+  const encrypted = Buffer.concat([cipher.update(plain, "utf8"), cipher.final()]);
+
+  return Buffer.concat([iv, cipher.getAuthTag(), encrypted]).toString("base64");
+}
+
+function safeDecrypt(payload) {
+  try {
+    const raw = Buffer.from(payload, "base64");
+    const decipher = createDecipheriv("aes-256-gcm", getKey(), raw.subarray(0, 12));
+    decipher.setAuthTag(raw.subarray(12, 28));
+
+    return Buffer.concat([
+      decipher.update(raw.subarray(28)),
+      decipher.final(),
+    ]).toString("utf8");
+  } catch {
+    return null;
+  }
+}
+
+function hashAdminPassword(password) {
+  const salt = randomBytes(16);
+  const hash = scryptSync(password, salt, 32);
+
+  return `scrypt$${salt.toString("hex")}$${hash.toString("hex")}`;
+}
+
+function adminPasswordMatches(input) {
+  const [scheme, saltHex, hashHex] = String(data.adminPasswordHash).split("$");
+  if (scheme !== "scrypt" || !saltHex || !hashHex) return false;
+
+  const expected = Buffer.from(hashHex, "hex");
+  const actual = scryptSync(input, Buffer.from(saltHex, "hex"), expected.length);
+
+  return timingSafeEqual(actual, expected);
+}
+
+function secretMatches(input) {
+  const hash = (value) => createHash("sha256").update(value, "utf8").digest();
+
+  return timingSafeEqual(hash(input), hash(SECRET_PASSWORD));
+}
+
+// Changing BOT_TOKEN or SECRET_PASSWORD logs out normal users.
+function usersFingerprint() {
   return createHash("sha256")
     .update(JSON.stringify([BOT_TOKEN, SECRET_PASSWORD, SITE_USERNAME]))
     .digest("hex");
 }
 
-function isValidCookieValue(value) {
-  return /^[A-Za-z0-9%._~+\/=-]+$/.test(value);
+function validIds(list) {
+  return Array.isArray(list)
+    ? list.filter((id) => Number.isSafeInteger(id) && id > 0)
+    : [];
 }
 
-function loadState() {
-  let stored;
+function loadData() {
+  let stored = null;
 
   try {
-    stored = JSON.parse(readFileSync(STATE_FILE, "utf8"));
+    stored = JSON.parse(readFileSync(DATA_FILE, "utf8"));
   } catch (error) {
-    if (error.code === "ENOENT") return;
-
-    throw new Error(
-      "Could not read toggle-bot-state.json. " +
-        "Fix or delete that file, then restart the bot."
-    );
-  }
-
-  if (stored.version !== 3 || stored.fingerprint !== fingerprint()) return;
-
-  if (Array.isArray(stored.users)) {
-    for (const id of stored.users) {
-      if (Number.isSafeInteger(id) && id > 0) authenticatedUsers.add(id);
+    if (error.code !== "ENOENT") {
+      throw new Error(
+        "Could not read toggle-bot-data.json. " +
+          "Fix or delete that file, then restart the bot."
+      );
     }
   }
 
-  if (
-    typeof stored.cookie === "string" &&
-    isValidCookieValue(stored.cookie) &&
-    Number.isFinite(stored.expiresAt)
-  ) {
-    state.cookie = stored.cookie;
-    state.expiresAt = stored.expiresAt;
+  if (!stored) {
+    // First start of this version: keep users from the old auth file.
+    try {
+      const legacy = JSON.parse(readFileSync(LEGACY_AUTH_FILE, "utf8"));
+
+      if (legacy.version === 1 && legacy.fingerprint === usersFingerprint()) {
+        data.users = validIds(legacy.userIds);
+      }
+    } catch {
+      // No usable legacy file.
+    }
+
+    return;
   }
 
-  for (const key of ["lastPrimaryDate", "lastSuccessDate", "lastRetryDate"]) {
-    if (typeof stored[key] === "string") state[key] = stored[key];
+  if (stored.version !== 4) {
+    throw new Error("Unsupported toggle-bot-data.json. Delete it and restart.");
+  }
+
+  data.admins = validIds(stored.admins);
+  data.adminPasswordHash =
+    typeof stored.adminPasswordHash === "string" ? stored.adminPasswordHash : "";
+
+  data.accounts = (Array.isArray(stored.accounts) ? stored.accounts : []).filter(
+    (a) =>
+      typeof a?.id === "string" &&
+      typeof a?.username === "string" &&
+      typeof a?.password === "string"
+  );
+
+  const usersValid = stored.usersFingerprint === usersFingerprint();
+  data.users = usersValid ? validIds(stored.users) : [];
+
+  for (const [key, value] of Object.entries(stored.modes || {})) {
+    const id = Number(key);
+    const allowed = data.admins.includes(id) || data.users.includes(id);
+    if (allowed && (value === "token" || value === "account")) {
+      data.modes[key] = value;
+    }
+  }
+
+  for (const [key, value] of Object.entries(stored.userTokens || {})) {
+    const id = Number(key);
+    const allowed = data.admins.includes(id) || data.users.includes(id);
+    if (allowed && typeof value === "string") data.userTokens[key] = value;
   }
 }
 
-function saveState() {
-  const stored = {
-    version: 3,
-    fingerprint: fingerprint(),
-    users: [...authenticatedUsers],
-    ...state,
-  };
+function saveData() {
+  const stored = { version: 4, usersFingerprint: usersFingerprint(), ...data };
 
-  writeFileSync(STATE_TEMP_FILE, JSON.stringify(stored, null, 2), {
+  writeFileSync(DATA_TEMP_FILE, JSON.stringify(stored, null, 2), {
     encoding: "utf8",
     mode: 0o600,
   });
 
-  renameSync(STATE_TEMP_FILE, STATE_FILE);
+  renameSync(DATA_TEMP_FILE, DATA_FILE);
+}
+
+// Applies a change and saves it. Rolls back if saving fails.
+function mutate(change) {
+  const snapshot = structuredClone(data);
+
+  try {
+    change(data);
+    saveData();
+    return true;
+  } catch {
+    Object.assign(data, snapshot);
+    return false;
+  }
 }
 
 function trySaveState() {
@@ -167,24 +301,11 @@ function validateConfiguration() {
     throw new Error("Please install Node.js 22 or newer.");
   }
 
-  const values = {
-    BOT_TOKEN,
-    SITE_USERNAME,
-    SITE_PASSWORD,
-    SECRET_PASSWORD,
-  };
-
-  for (const [name, value] of Object.entries(values)) {
-    if (!value || value.startsWith("PASTE_")) {
-      throw new Error(`Fill in ${name} at the top of the script.`);
-    }
-  }
-
   if (!/^\d+:[A-Za-z0-9_-]+$/.test(BOT_TOKEN)) {
     throw new Error("BOT_TOKEN has an invalid format.");
   }
 
-  if (SECRET_PASSWORD.length < 12) {
+  if (!SECRET_PASSWORD || SECRET_PASSWORD.length < 12) {
     throw new Error("SECRET_PASSWORD must be at least 12 characters.");
   }
 
@@ -203,40 +324,71 @@ function validateConfiguration() {
   }
 }
 
-function passwordMatches(input) {
-  const hash = (value) => createHash("sha256").update(value, "utf8").digest();
+function initialize() {
+  validateConfiguration();
+  getKey();
+  loadData();
 
-  return timingSafeEqual(hash(input), hash(SECRET_PASSWORD));
+  if (!data.adminPasswordHash) {
+    if (!INITIAL_ADMIN_PASSWORD || INITIAL_ADMIN_PASSWORD.length < 12) {
+      throw new Error("INITIAL_ADMIN_PASSWORD must be at least 12 characters.");
+    }
+
+    const ok = mutate((d) => {
+      d.adminPasswordHash = hashAdminPassword(INITIAL_ADMIN_PASSWORD);
+    });
+
+    if (!ok) throw new Error("Could not write toggle-bot-data.json.");
+  }
 }
 
-// Current date (YYYY-MM-DD) and minutes since midnight in TIMEZONE.
-function localNow() {
-  const parts = Object.fromEntries(
-    new Intl.DateTimeFormat("en-CA", {
-      timeZone: TIMEZONE,
-      year: "numeric",
-      month: "2-digit",
-      day: "2-digit",
-      hour: "2-digit",
-      minute: "2-digit",
-      hourCycle: "h23",
-    })
-      .formatToParts(new Date())
-      .map((part) => [part.type, part.value])
-  );
+const isAdmin = (id) => data.admins.includes(id);
+const isAuthed = (id) => isAdmin(id) || data.users.includes(id);
 
-  return {
-    date: `${parts.year}-${parts.month}-${parts.day}`,
-    minutes: Number(parts.hour) * 60 + Number(parts.minute),
-  };
+function isValidCookieValue(value) {
+  return /^[A-Za-z0-9%._~+\/=-]+$/.test(value);
 }
 
-function formatTime(timestamp) {
-  return new Date(timestamp).toLocaleTimeString("hu-HU", {
-    timeZone: TIMEZONE,
-    hour: "2-digit",
-    minute: "2-digit",
-  });
+function parseUserToken(raw) {
+  let value = String(raw).trim();
+
+  if (value.toLowerCase().startsWith(`${COOKIE_NAME.toLowerCase()}=`)) {
+    value = value.slice(COOKIE_NAME.length + 1);
+  }
+
+  value = value.split(";")[0].trim().replace(/^"(.*)"$/, "$1");
+
+  if (value.length < 16 || value.length > 4096 || !isValidCookieValue(value)) {
+    return null;
+  }
+
+  return value;
+}
+
+function lockSecondsLeft(map, userId, now) {
+  const record = map.get(userId);
+  if (!record) return 0;
+
+  if (record.lockedUntil > now) {
+    return Math.ceil((record.lockedUntil - now) / 1000);
+  }
+
+  if (record.lockedUntil !== 0) map.delete(userId);
+  return 0;
+}
+
+function registerFailure(map, userId, now) {
+  const record = map.get(userId) || { failures: 0, lockedUntil: 0, updatedAt: now };
+
+  record.failures += 1;
+  record.updatedAt = now;
+
+  if (record.failures >= MAX_PASSWORD_ATTEMPTS) {
+    record.lockedUntil = now + LOCKOUT_DURATION_MS;
+  }
+
+  map.set(userId, record);
+  return record.lockedUntil > now;
 }
 
 async function telegram(method, payload = {}, timeoutMs = 15000) {
@@ -273,34 +425,34 @@ async function telegram(method, payload = {}, timeoutMs = 15000) {
   return result.result;
 }
 
-function sendMessage(chatId, text, keyboard = HIDE_MENU) {
-  return telegram("sendMessage", {
-    chat_id: chatId,
-    text,
-    reply_markup: keyboard,
-  });
+// replyMarkup is optional: when omitted, the current keyboard stays as it is.
+function sendMessage(chatId, text, replyMarkup) {
+  const payload = { chat_id: chatId, text, disable_web_page_preview: true };
+  if (replyMarkup) payload.reply_markup = replyMarkup;
+
+  return telegram("sendMessage", payload);
 }
 
-async function deleteMessageQuietly(chatId, messageId) {
+async function quietly(promise) {
   try {
-    await telegram("deleteMessage", {
-      chat_id: chatId,
-      message_id: messageId,
-    });
+    await promise;
   } catch {
-    // Best effort only. Never log or echo passwords.
+    // Best effort only.
   }
 }
 
-// In private chats the chat ID equals the user ID.
-async function notifyUsers(text) {
-  for (const userId of authenticatedUsers) {
-    try {
-      await sendMessage(userId, text, MENU);
-    } catch {
-      // Ignore users who blocked the bot.
-    }
-  }
+// Used for messages that contain passwords or tokens.
+function deleteMessageQuietly(chatId, messageId) {
+  return quietly(
+    telegram("deleteMessage", { chat_id: chatId, message_id: messageId })
+  );
+}
+
+function describeUser(from) {
+  const name =
+    [from.first_name, from.last_name].filter(Boolean).join(" ") || "Unknown";
+
+  return `${name}${from.username ? ` (@${from.username})` : ""}, ID ${from.id}`;
 }
 
 function extractAuthCookie(response) {
@@ -331,8 +483,8 @@ function extractAuthCookie(response) {
   return null;
 }
 
-// One login attempt. Never includes the password in any message.
-async function loginToSite() {
+// One login attempt on the website. Messages never contain the password.
+async function loginToSite(username, password) {
   try {
     const response = await fetch(LOGIN_URL, {
       method: "POST",
@@ -343,20 +495,15 @@ async function loginToSite() {
         Origin: SITE_ORIGIN,
         Referer: LOGIN_PAGE_URL,
       },
-      body: new URLSearchParams({
-        redirectTo: "",
-        username: SITE_USERNAME,
-        password: SITE_PASSWORD,
-      }),
+      body: new URLSearchParams({ redirectTo: "", username, password }),
       redirect: "manual",
       signal: AbortSignal.timeout(15000),
     });
 
-    const text = await response.text();
-
     let result = null;
+
     try {
-      result = JSON.parse(text);
+      result = JSON.parse(await response.text());
     } catch {
       // Non-JSON response; handled below.
     }
@@ -410,115 +557,63 @@ async function loginToSite() {
   }
 }
 
-// Logs in and stores the new token. Only one login runs at a time.
-function refreshToken(reason) {
-  if (refreshInProgress) return refreshInProgress;
+// Logs in with a saved account (one attempt, shared between callers).
+function loginAccount(account) {
+  const blockedUntil = accountBlockedUntil.get(account.id) || 0;
 
-  refreshInProgress = (async () => {
-    const result = await loginToSite();
+  if (blockedUntil > Date.now()) {
+    const seconds = Math.ceil((blockedUntil - Date.now()) / 1000);
 
-    if (result.ok) {
-      state.cookie = result.cookie.value;
-      state.expiresAt = result.cookie.expiresAt;
-      trySaveState();
+    return Promise.resolve({
+      ok: false,
+      message: `The last website login failed. Next attempt possible in ${seconds} seconds.`,
+    });
+  }
 
-      console.log(
-        `[${new Date().toISOString()}] Token refreshed (${reason}). ` +
-          `Valid until ${formatTime(state.expiresAt)}.`
-      );
-    } else {
-      console.error(
-        `[${new Date().toISOString()}] Token refresh failed (${reason}): ` +
-          result.message
-      );
+  if (accountLogins.has(account.id)) return accountLogins.get(account.id);
+
+  const promise = (async () => {
+    const password = safeDecrypt(account.password);
+
+    if (password === null) {
+      return {
+        ok: false,
+        message: "The saved account could not be decrypted. Re-add it with /accounts.",
+      };
     }
 
-    return result;
-  })().finally(() => {
-    refreshInProgress = null;
-  });
+    const result = await loginToSite(account.username, password);
 
-  return refreshInProgress;
+    if (result.ok) {
+      accountBlockedUntil.delete(account.id);
+      accountSessions.set(account.id, {
+        cookie: result.cookie.value,
+        expiresAt: result.cookie.expiresAt,
+      });
+
+      return { ok: true, cookie: result.cookie.value };
+    }
+
+    accountBlockedUntil.set(
+      account.id,
+      Date.now() + (result.wrongCredentials ? BAD_PASSWORD_DELAY_MS : RETRY_DELAY_MS)
+    );
+
+    return { ok: false, message: result.message };
+  })().finally(() => accountLogins.delete(account.id));
+
+  accountLogins.set(account.id, promise);
+  return promise;
 }
 
-// Used before a toggle: logs in only if there is no valid token.
-async function ensureToken() {
-  if (state.cookie && state.expiresAt > Date.now() + 30 * 1000) {
-    return { ok: true };
+async function ensureAccountCookie(account) {
+  const cached = accountSessions.get(account.id);
+
+  if (cached && cached.expiresAt > Date.now() + 30 * 1000) {
+    return { ok: true, cookie: cached.cookie };
   }
 
-  if (onDemandBlockedUntil > Date.now()) {
-    const seconds = Math.ceil((onDemandBlockedUntil - Date.now()) / 1000);
-
-    return {
-      ok: false,
-      message:
-        "The token has expired and the last login attempt failed. " +
-        `Next automatic attempt in about ${seconds} seconds.`,
-    };
-  }
-
-  const result = await refreshToken("on demand");
-
-  if (!result.ok) {
-    onDemandBlockedUntil =
-      Date.now() +
-      (result.wrongCredentials
-        ? ON_DEMAND_BAD_PASSWORD_DELAY_MS
-        : ON_DEMAND_RETRY_DELAY_MS);
-
-    return {
-      ok: false,
-      message: `Could not log in to the website. ${result.message}`,
-    };
-  }
-
-  onDemandBlockedUntil = 0;
-  return { ok: true };
-}
-
-// Runs every 30 seconds: 04:00 login, then 06:00 retry if 04:00 failed.
-async function runScheduler() {
-  const now = localNow();
-
-  if (now.minutes >= DAILY_MINUTES && state.lastPrimaryDate !== now.date) {
-    state.lastPrimaryDate = now.date;
-    trySaveState();
-
-    const result = await refreshToken(`scheduled ${DAILY_LOGIN_TIME}`);
-
-    if (result.ok) {
-      state.lastSuccessDate = now.date;
-      onDemandBlockedUntil = 0;
-      trySaveState();
-    }
-
-    return;
-  }
-
-  if (
-    now.minutes >= RETRY_MINUTES &&
-    state.lastPrimaryDate === now.date &&
-    state.lastSuccessDate !== now.date &&
-    state.lastRetryDate !== now.date
-  ) {
-    state.lastRetryDate = now.date;
-    trySaveState();
-
-    const result = await refreshToken(`retry ${RETRY_LOGIN_TIME}`);
-
-    if (result.ok) {
-      state.lastSuccessDate = now.date;
-      onDemandBlockedUntil = 0;
-      trySaveState();
-    } else {
-      await notifyUsers(
-        `Automatic login failed at ${DAILY_LOGIN_TIME} and again at ` +
-          `${RETRY_LOGIN_TIME}. ${result.message} ` +
-          "The bot will try to log in when you press toggle."
-      );
-    }
-  }
+  return loginAccount(account);
 }
 
 // Returns { text, sessionInvalid }. A toggle is never retried automatically.
@@ -527,7 +622,7 @@ async function sendToggleRequest(cookie) {
     " Check the website before trying again. No automatic retry was made.";
 
   try {
-    const response = await fetch(TOGGLE_URL, {
+    const response = await fetch(TARGET_URL, {
       method: "POST",
       headers: {
         Accept: "application/json, */*;q=0.9",
@@ -535,7 +630,7 @@ async function sendToggleRequest(cookie) {
         "Content-Type": "application/x-www-form-urlencoded",
         Cookie: `${COOKIE_NAME}=${cookie}`,
         Origin: SITE_ORIGIN,
-        Referer: TOGGLE_PAGE_URL,
+        Referer: PAGE_URL,
       },
       body: new URLSearchParams(),
       redirect: "manual",
@@ -633,6 +728,517 @@ async function sendToggleRequest(cookie) {
   }
 }
 
+// ---------------------------------------------------------------
+// Accounts view (usernames only, never passwords)
+// ---------------------------------------------------------------
+
+function shorten(text, max = 28) {
+  return text.length > max ? `${text.slice(0, max - 1)}...` : text;
+}
+
+function buildAccountsView() {
+  const count = data.accounts.length;
+
+  const text = count
+    ? `Website accounts (${count}):\n` +
+      data.accounts
+        .map((a, i) => `${i + 1}. ${a.username}${i === 0 ? " (default)" : ""}`)
+        .join("\n") +
+      "\n\nThe first account is used by default."
+    : "No website accounts yet. Add one with the button below.";
+
+  const rows = data.accounts.map((a) => [
+    { text: `Delete ${shorten(a.username)}`, callback_data: `d:${a.id}` },
+  ]);
+
+  rows.push([{ text: "Add new account", callback_data: "a" }]);
+
+  return { text, reply_markup: { inline_keyboard: rows } };
+}
+
+function sendAccountsView(chatId) {
+  const view = buildAccountsView();
+  return sendMessage(chatId, view.text, view.reply_markup);
+}
+
+function editMessage(chatId, messageId, text, replyMarkup) {
+  return quietly(
+    telegram("editMessageText", {
+      chat_id: chatId,
+      message_id: messageId,
+      text,
+      reply_markup: replyMarkup,
+    })
+  );
+}
+
+async function addAccount(chatId, username, password) {
+  await sendMessage(chatId, "Checking the login with the website...");
+
+  const result = await loginToSite(username, password);
+
+  if (!result.ok) {
+    await sendMessage(
+      chatId,
+      "Nothing was saved. " +
+        (result.wrongCredentials
+          ? "The website rejected that username or password."
+          : `${result.message} Try again later.`)
+    );
+    return;
+  }
+
+  if (data.accounts.some((a) => a.username === username)) {
+    await sendMessage(chatId, "That account already exists. Nothing was saved.");
+    return;
+  }
+
+  const id = randomBytes(4).toString("hex");
+  const saved = mutate((d) => {
+    d.accounts.push({ id, username, password: encryptText(password) });
+  });
+
+  if (!saved) {
+    await sendMessage(
+      chatId,
+      "Could not save the account. Check that the bot's folder is writable."
+    );
+    return;
+  }
+
+  accountSessions.set(id, {
+    cookie: result.cookie.value,
+    expiresAt: result.cookie.expiresAt,
+  });
+
+  await sendMessage(chatId, `Account "${username}" added.`);
+  await sendAccountsView(chatId);
+}
+
+// ---------------------------------------------------------------
+// Callback buttons (admins only)
+// ---------------------------------------------------------------
+
+async function handleCallback(query) {
+  const answer = (text) =>
+    quietly(
+      telegram("answerCallbackQuery", {
+        callback_query_id: query.id,
+        ...(text ? { text } : {}),
+      })
+    );
+
+  const userId = query.from?.id;
+  const message = query.message;
+
+  if (
+    !userId ||
+    query.from.is_bot ||
+    message?.chat?.type !== "private" ||
+    message.chat.id !== userId ||
+    (ALLOWED_USER_IDS.length > 0 && !ALLOWED_USER_IDS.includes(userId))
+  ) {
+    await answer();
+    return;
+  }
+
+  if (!isAdmin(userId)) {
+    await answer("Admins only.");
+    return;
+  }
+
+  const payload = typeof query.data === "string" ? query.data : "";
+
+  if (!/^(a|c|[dy]:[0-9a-f]{8})$/.test(payload)) {
+    await answer();
+    return;
+  }
+
+  const chatId = message.chat.id;
+  const [action, id] = payload.split(":");
+  const showList = () => {
+    const view = buildAccountsView();
+    return editMessage(chatId, message.message_id, view.text, view.reply_markup);
+  };
+
+  if (action === "a") {
+    pending.set(userId, { type: "add_username", username: "", startedAt: Date.now() });
+    await answer();
+    await sendMessage(
+      chatId,
+      "Send the username of the new website account. Send /cancel to abort."
+    );
+    return;
+  }
+
+  if (action === "c") {
+    await answer();
+    await showList();
+    return;
+  }
+
+  const account = data.accounts.find((a) => a.id === id);
+
+  if (!account) {
+    await answer("That account no longer exists.");
+    await showList();
+    return;
+  }
+
+  if (action === "d") {
+    await answer();
+    await editMessage(
+      chatId,
+      message.message_id,
+      `Delete the account "${account.username}"? This cannot be undone.`,
+      {
+        inline_keyboard: [
+          [
+            { text: "Yes, delete", callback_data: `y:${account.id}` },
+            { text: "Cancel", callback_data: "c" },
+          ],
+        ],
+      }
+    );
+    return;
+  }
+
+  const removed = mutate((d) => {
+    d.accounts = d.accounts.filter((a) => a.id !== account.id);
+  });
+
+  if (removed) {
+    accountSessions.delete(account.id);
+    accountBlockedUntil.delete(account.id);
+  }
+
+  await answer(removed ? "Deleted." : "Could not save the change.");
+  await showList();
+}
+
+// ---------------------------------------------------------------
+// Messages
+// ---------------------------------------------------------------
+
+function helpText(userId) {
+  const lines = [
+    "Commands:",
+    "/token - use your own website token (send /token YOUR_TOKEN to set or replace it)",
+    "/switch - go back to the website account",
+  ];
+
+  if (isAdmin(userId)) {
+    lines.push(
+      "/accounts - manage the website accounts",
+      "/adminp CURRENT NEW - change the admin password"
+    );
+  }
+
+  return lines.join("\n");
+}
+
+async function handleAdminLogin(message, command, now) {
+  const chatId = message.chat.id;
+  const userId = message.from.id;
+
+  // The message contains a password: remove it from the chat.
+  await deleteMessageQuietly(chatId, message.message_id);
+
+  if (command.args.length !== 1) {
+    await sendMessage(chatId, "Usage: /admin PASSWORD");
+    return;
+  }
+
+  const wait = lockSecondsLeft(adminAttempts, userId, now);
+
+  if (wait) {
+    await sendMessage(chatId, `Too many incorrect passwords. Try again in ${wait} seconds.`);
+    return;
+  }
+
+  if (!adminPasswordMatches(command.args[0])) {
+    const locked = registerFailure(adminAttempts, userId, now);
+
+    await sendMessage(
+      chatId,
+      locked
+        ? "Too many incorrect passwords. Locked for 5 minutes."
+        : "Incorrect admin password."
+    );
+    return;
+  }
+
+  adminAttempts.delete(userId);
+
+  if (isAdmin(userId)) {
+    await sendMessage(chatId, "You are already an admin.", MENU);
+    return;
+  }
+
+  const saved = mutate((d) => {
+    d.admins.push(userId);
+  });
+
+  if (!saved) {
+    await sendMessage(
+      chatId,
+      "The password was correct, but the change could not be saved. " +
+        "Check that the bot's folder is writable."
+    );
+    return;
+  }
+
+  await sendMessage(
+    chatId,
+    "You are now an admin. Send /help to see your commands.",
+    MENU
+  );
+
+  for (const adminId of data.admins) {
+    if (adminId === userId) continue;
+
+    await quietly(
+      sendMessage(adminId, `A new admin logged in: ${describeUser(message.from)}.`)
+    );
+  }
+}
+
+async function handleSecretPassword(message, text, now) {
+  const chatId = message.chat.id;
+  const userId = message.from.id;
+  const wait = lockSecondsLeft(passwordAttempts, userId, now);
+
+  if (wait) {
+    await sendMessage(
+      chatId,
+      `Too many incorrect passwords. Try again in ${wait} seconds.`,
+      HIDE_MENU
+    );
+    return;
+  }
+
+  if (!text) {
+    await sendMessage(chatId, "Enter the secret password as a text message:", HIDE_MENU);
+    return;
+  }
+
+  await deleteMessageQuietly(chatId, message.message_id);
+
+  if (!secretMatches(text)) {
+    const locked = registerFailure(passwordAttempts, userId, now);
+
+    await sendMessage(
+      chatId,
+      locked
+        ? "Too many incorrect passwords. Locked for 5 minutes."
+        : "Incorrect password. Try again:",
+      HIDE_MENU
+    );
+    return;
+  }
+
+  passwordAttempts.delete(userId);
+
+  const saved = mutate((d) => {
+    if (!d.users.includes(userId)) d.users.push(userId);
+  });
+
+  if (!saved) {
+    await sendMessage(
+      chatId,
+      "The password was correct, but authentication could not be saved. " +
+        "Check that the bot's folder is writable, then try again.",
+      HIDE_MENU
+    );
+    return;
+  }
+
+  await sendMessage(
+    chatId,
+    "Authenticated. Your login does not expire. Use toggle below. " +
+      "Send /help for commands.",
+    MENU
+  );
+}
+
+async function handlePendingInput(message, text, entry, now) {
+  const chatId = message.chat.id;
+  const userId = message.from.id;
+
+  if (!text) {
+    await sendMessage(chatId, "Please send text, or /cancel to abort.");
+    return;
+  }
+
+  if (entry.type === "token") {
+    await deleteMessageQuietly(chatId, message.message_id);
+    const token = parseUserToken(text);
+
+    if (!token) {
+      await sendMessage(
+        chatId,
+        "That does not look like a valid token. Send it again, or /cancel."
+      );
+      return;
+    }
+
+    pending.delete(userId);
+    await saveUserToken(chatId, userId, token);
+    return;
+  }
+
+  if (!isAdmin(userId)) {
+    pending.delete(userId);
+    return;
+  }
+
+  if (entry.type === "add_username") {
+    const username = text.trim();
+
+    if (!username || username.length > 100 || /[\r\n]/.test(username)) {
+      await sendMessage(chatId, "Invalid username. Send another one, or /cancel.");
+      return;
+    }
+
+    if (data.accounts.some((a) => a.username === username)) {
+      await sendMessage(chatId, "That username already exists. Send another one, or /cancel.");
+      return;
+    }
+
+    entry.type = "add_password";
+    entry.username = username;
+    entry.startedAt = now;
+
+    await sendMessage(
+      chatId,
+      `Now send the password for "${username}". The bot will try to delete your message. Send /cancel to abort.`
+    );
+    return;
+  }
+
+  // add_password
+  await deleteMessageQuietly(chatId, message.message_id);
+  pending.delete(userId);
+
+  if (text.length > 200) {
+    await sendMessage(chatId, "That password is too long. Nothing was saved.");
+    return;
+  }
+
+  await addAccount(chatId, entry.username, text);
+}
+
+async function saveUserToken(chatId, userId, token) {
+  let saved = false;
+
+  try {
+    saved = mutate((d) => {
+      d.userTokens[String(userId)] = encryptText(token);
+      d.modes[String(userId)] = "token";
+    });
+  } catch {
+    saved = false;
+  }
+
+  await sendMessage(
+    chatId,
+    saved
+      ? "Token saved. Your token is used now. Send /switch to go back to the website account."
+      : "Could not save the token. Check that the bot's folder is writable.",
+    MENU
+  );
+}
+
+async function handleToggle(chatId, userId, now) {
+  if (now - lastToggleAt < TOGGLE_COOLDOWN_MS) {
+    await sendMessage(chatId, "Please wait a few seconds before another toggle.", MENU);
+    return;
+  }
+
+  lastToggleAt = now;
+
+  let cookie;
+  let label;
+  let account = null;
+
+  if (data.modes[String(userId)] === "token") {
+    const encrypted = data.userTokens[String(userId)];
+    cookie = encrypted ? safeDecrypt(encrypted) : null;
+    label = "your token";
+
+    if (!cookie) {
+      await sendMessage(
+        chatId,
+        "No usable token is saved. Send /token YOUR_TOKEN, or /switch to use the website account.",
+        MENU
+      );
+      return;
+    }
+  } else {
+    account = data.accounts[0];
+    label = "account";
+
+    if (!account) {
+      await sendMessage(
+        chatId,
+        "No website account is configured yet. An admin must add one with /accounts.",
+        MENU
+      );
+      return;
+    }
+
+    const login = await ensureAccountCookie(account);
+
+    if (!login.ok) {
+      await sendMessage(
+        chatId,
+        `Could not log in to the website. ${login.message} The toggle was not performed.`,
+        MENU
+      );
+      return;
+    }
+
+    cookie = login.cookie;
+  }
+
+  const result = await sendToggleRequest(cookie);
+
+  if (result.sessionInvalid) {
+    if (account) {
+      accountSessions.delete(account.id);
+      const fresh = await loginAccount(account);
+
+      await sendMessage(
+        chatId,
+        fresh.ok
+          ? `${result.text} A new login was fetched. Press toggle again.`
+          : `${result.text} ${fresh.message}`,
+        MENU
+      );
+    } else {
+      await sendMessage(
+        chatId,
+        `${result.text} Send /token NEW_TOKEN to replace it, or /switch to use the website account.`,
+        MENU
+      );
+    }
+
+    return;
+  }
+
+  // If this reply fails, do NOT repeat the website request.
+  await sendMessage(chatId, `(${label}) ${result.text}`, MENU);
+}
+
+function parseCommand(text) {
+  const trimmed = text.trim();
+  if (!trimmed.startsWith("/")) return null;
+
+  const [first, ...args] = trimmed.split(/\s+/);
+
+  return { name: first.slice(1).split("@")[0].toLowerCase(), args };
+}
+
 async function handleMessage(message) {
   if (
     message?.chat?.type !== "private" ||
@@ -649,6 +1255,7 @@ async function handleMessage(message) {
     return;
   }
 
+  // Ignore stale commands after a connection outage.
   if (
     !Number.isFinite(message.date) ||
     Date.now() / 1000 - message.date > MAX_MESSAGE_AGE_SECONDS
@@ -657,165 +1264,247 @@ async function handleMessage(message) {
   }
 
   const text = typeof message.text === "string" ? message.text : "";
-  const command = text.trim();
+  const command = parseCommand(text);
   const now = Date.now();
 
-  if (command === "/logout") {
-    authenticatedUsers.delete(userId);
-    const saved = trySaveState();
+  if (command?.name === "start") {
+    pending.delete(userId);
+
+    if (isAuthed(userId)) {
+      await sendMessage(chatId, "You are authenticated. Use the toggle button below.", MENU);
+    } else {
+      await sendMessage(chatId, "Enter the secret password:", HIDE_MENU);
+    }
+    return;
+  }
+
+  if (command?.name === "admin") {
+    await handleAdminLogin(message, command, now);
+    return;
+  }
+
+  if (command?.name === "logout") {
+    pending.delete(userId);
+
+    const saved = mutate((d) => {
+      d.admins = d.admins.filter((id) => id !== userId);
+      d.users = d.users.filter((id) => id !== userId);
+      delete d.modes[String(userId)];
+      delete d.userTokens[String(userId)];
+    });
 
     await sendMessage(
       chatId,
-      "Logged out. Enter the secret password to authenticate again:" +
-        (saved ? "" : " (Warning: the logout could not be saved to disk.)")
+      saved
+        ? "Logged out. Enter the secret password to authenticate again:"
+        : "Could not save the logout. Check that the bot's folder is writable.",
+      saved ? HIDE_MENU : MENU
     );
     return;
   }
 
-  if (command === "/start") {
-    if (authenticatedUsers.has(userId)) {
-      await sendMessage(
-        chatId,
-        "You are authenticated. Use the toggle button below.",
-        MENU
-      );
+  if (!isAuthed(userId)) {
+    if (command) {
+      await sendMessage(chatId, "Enter the secret password first:", HIDE_MENU);
     } else {
-      await sendMessage(chatId, "Enter the secret password:");
+      await handleSecretPassword(message, text, now);
     }
-
     return;
   }
 
-  if (!authenticatedUsers.has(userId)) {
-    let attempts = passwordAttempts.get(userId) || {
-      failures: 0,
-      lockedUntil: 0,
-      updatedAt: now,
-    };
+  let entry = pending.get(userId);
 
-    if (attempts.lockedUntil > now) {
-      const seconds = Math.ceil((attempts.lockedUntil - now) / 1000);
+  if (entry && now - entry.startedAt > PENDING_TIMEOUT_MS) {
+    pending.delete(userId);
+    entry = undefined;
+  }
 
-      await sendMessage(
-        chatId,
-        `Too many incorrect passwords. Try again in ${seconds} seconds.`
-      );
+  if (entry) {
+    if (command?.name === "cancel") {
+      pending.delete(userId);
+      await sendMessage(chatId, "Cancelled.", MENU);
       return;
     }
 
-    if (attempts.lockedUntil !== 0) {
-      attempts = { failures: 0, lockedUntil: 0, updatedAt: now };
-    }
+    // A password may start with "/", so only /cancel interrupts that step.
+    const knownCommand = command && KNOWN_COMMANDS.has(command.name);
 
-    if (!text) {
-      await sendMessage(chatId, "Enter the secret password as a text message:");
+    if (!knownCommand || entry.type === "add_password") {
+      await handlePendingInput(message, text, entry, now);
       return;
     }
 
-    await deleteMessageQuietly(chatId, message.message_id);
+    pending.delete(userId);
+  }
 
-    if (!passwordMatches(text)) {
-      attempts.failures += 1;
-      attempts.updatedAt = now;
+  if (!command) {
+    if (text.trim().toLowerCase() === "toggle") {
+      await handleToggle(chatId, userId, now);
+    } else {
+      await sendMessage(chatId, "Use the toggle button below.", MENU);
+    }
+    return;
+  }
 
-      if (attempts.failures >= MAX_PASSWORD_ATTEMPTS) {
-        attempts.lockedUntil = now + LOCKOUT_DURATION_MS;
+  switch (command.name) {
+    case "help":
+      await sendMessage(chatId, helpText(userId), MENU);
+      return;
+
+    case "cancel":
+      await sendMessage(chatId, "Nothing to cancel.", MENU);
+      return;
+
+    case "switch": {
+      if (data.modes[String(userId)] !== "token") {
+        await sendMessage(chatId, "You are already using the website account.", MENU);
+        return;
       }
 
-      passwordAttempts.set(userId, attempts);
+      const saved = mutate((d) => {
+        d.modes[String(userId)] = "account";
+      });
 
       await sendMessage(
         chatId,
-        attempts.lockedUntil > now
-          ? "Too many incorrect passwords. Locked for 5 minutes."
-          : "Incorrect password. Try again:"
+        saved
+          ? "Switched back to the website account."
+          : "Could not save the change. Check that the bot's folder is writable.",
+        MENU
       );
       return;
     }
 
-    passwordAttempts.delete(userId);
-    authenticatedUsers.add(userId);
+    case "token": {
+      if (command.args.length > 0) {
+        await deleteMessageQuietly(chatId, message.message_id);
+        const token = parseUserToken(command.args.join(""));
 
-    if (!trySaveState()) {
-      authenticatedUsers.delete(userId);
+        if (!token) {
+          await sendMessage(
+            chatId,
+            "That does not look like a valid token. Send /token YOUR_TOKEN (only the token value).",
+            MENU
+          );
+          return;
+        }
+
+        await saveUserToken(chatId, userId, token);
+        return;
+      }
+
+      if (data.userTokens[String(userId)]) {
+        const saved = mutate((d) => {
+          d.modes[String(userId)] = "token";
+        });
+
+        await sendMessage(
+          chatId,
+          saved
+            ? "Your token is used now. Send /switch to go back to the website account, or /token NEW_TOKEN to replace it."
+            : "Could not save the change. Check that the bot's folder is writable.",
+          MENU
+        );
+        return;
+      }
+
+      pending.set(userId, { type: "token", username: "", startedAt: now });
 
       await sendMessage(
         chatId,
-        "The password was correct, but authentication could not be saved. " +
-          "Check that the bot's folder is writable, then try again."
+        "Send your AuthorizationToken value (only the value). " +
+          "The bot will try to delete your message. Send /cancel to abort."
       );
       return;
     }
 
-    await sendMessage(
-      chatId,
-      "Authenticated. Your login does not expire. Use toggle below.",
-      MENU
-    );
-    return;
+    case "accounts":
+      if (!isAdmin(userId)) break;
+      await sendAccountsView(chatId);
+      return;
+
+    case "adminp": {
+      if (!isAdmin(userId)) break;
+
+      // The message contains passwords: remove it from the chat.
+      await deleteMessageQuietly(chatId, message.message_id);
+
+      if (command.args.length !== 2) {
+        await sendMessage(
+          chatId,
+          "Usage: /adminp CURRENT_PASSWORD NEW_PASSWORD (passwords cannot contain spaces)."
+        );
+        return;
+      }
+
+      const [current, next] = command.args;
+      const wait = lockSecondsLeft(adminAttempts, userId, now);
+
+      if (wait) {
+        await sendMessage(chatId, `Too many incorrect passwords. Try again in ${wait} seconds.`);
+        return;
+      }
+
+      if (!adminPasswordMatches(current)) {
+        const locked = registerFailure(adminAttempts, userId, now);
+
+        await sendMessage(
+          chatId,
+          locked
+            ? "Too many incorrect passwords. Locked for 5 minutes."
+            : "The current admin password is incorrect."
+        );
+        return;
+      }
+
+      adminAttempts.delete(userId);
+
+      if (next.length < 12 || next.length > 200) {
+        await sendMessage(chatId, "The new admin password must be 12 to 200 characters.");
+        return;
+      }
+
+      if (next === current) {
+        await sendMessage(chatId, "The new password must differ from the current one.");
+        return;
+      }
+
+      const saved = mutate((d) => {
+        d.adminPasswordHash = hashAdminPassword(next);
+      });
+
+      await sendMessage(
+        chatId,
+        saved
+          ? "The admin password was changed."
+          : "Could not save the new password. Nothing was changed."
+      );
+      return;
+    }
+
+    default:
+      break;
   }
 
-  if (command.toLowerCase() !== "toggle") {
-    await sendMessage(chatId, "Use the toggle button below.", MENU);
-    return;
-  }
-
-  if (now - lastToggleAt < TOGGLE_COOLDOWN_MS) {
-    await sendMessage(
-      chatId,
-      "Please wait a few seconds before another toggle.",
-      MENU
-    );
-    return;
-  }
-
-  lastToggleAt = now;
-
-  const token = await ensureToken();
-
-  if (!token.ok) {
-    await sendMessage(chatId, `${token.message} The toggle was not performed.`, MENU);
-    return;
-  }
-
-  const result = await sendToggleRequest(state.cookie);
-
-  if (result.sessionInvalid) {
-    // The cookie was rejected before anything happened. Get a fresh one,
-    // but let the user decide to press toggle again.
-    state.cookie = "";
-    state.expiresAt = 0;
-    trySaveState();
-
-    const refreshed = await refreshToken("rejected token");
-
-    await sendMessage(
-      chatId,
-      refreshed.ok
-        ? `${result.text} A new token was fetched. Press toggle again.`
-        : `${result.text} ${refreshed.message}`,
-      MENU
-    );
-    return;
-  }
-
-  // If this reply fails, do NOT repeat the website request.
-  await sendMessage(chatId, result.text, MENU);
+  await sendMessage(chatId, "Unknown command. Send /help.", MENU);
 }
 
 function removeOldRecords() {
   const now = Date.now();
 
-  for (const [userId, attempts] of passwordAttempts) {
-    if (now - attempts.updatedAt > LOCKOUT_DURATION_MS * 2) {
-      passwordAttempts.delete(userId);
+  for (const map of [passwordAttempts, adminAttempts]) {
+    for (const [userId, record] of map) {
+      if (now - record.updatedAt > LOCKOUT_DURATION_MS * 2) map.delete(userId);
     }
+  }
+
+  for (const [userId, entry] of pending) {
+    if (now - entry.startedAt > PENDING_TIMEOUT_MS) pending.delete(userId);
   }
 }
 
 async function main() {
-  validateConfiguration();
-  loadState();
+  initialize();
 
   const bot = await telegram("getMe");
   const webhook = await telegram("getWebhookInfo");
@@ -831,7 +1520,7 @@ async function main() {
     offset: -1,
     limit: 1,
     timeout: 0,
-    allowed_updates: ["message"],
+    allowed_updates: ["message", "callback_query"],
   });
 
   let offset = pendingUpdates.length
@@ -871,7 +1560,11 @@ async function main() {
     try {
       const updates = await telegram(
         "getUpdates",
-        { offset, timeout: 25, allowed_updates: ["message"] },
+        {
+          offset,
+          timeout: 25,
+          allowed_updates: ["message", "callback_query"],
+        },
         35000
       );
 
@@ -885,11 +1578,13 @@ async function main() {
         try {
           if (update.message) {
             await handleMessage(update.message);
+          } else if (update.callback_query) {
+            await handleCallback(update.callback_query);
           }
         } catch {
           console.error(
-            "Message handling or reply failed. " +
-              "This message will not be retried. " +
+            "Update handling or reply failed. " +
+              "It will not be retried. " +
               "If you requested a toggle, check the website."
           );
         }
@@ -916,7 +1611,17 @@ async function main() {
   }
 }
 
-main().catch((error) => {
-  console.error(error.message);
-  process.exitCode = 1;
-});
+export { initialize, handleMessage, handleCallback, data };
+export const testHooks = {
+  resetCooldown() {
+    lastToggleAt = 0;
+  },
+};
+
+if (process.env.TOGGLE_BOT_TEST !== "1") {
+  main().catch((error) => {
+    // Never print request objects, passwords, or cookies.
+    console.error(error.message);
+    process.exitCode = 1;
+  });
+}
