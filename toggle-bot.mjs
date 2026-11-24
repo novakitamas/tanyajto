@@ -16,11 +16,22 @@ import { revealSecret } from "./secret-codec.mjs";
 // SETTINGS
 // ============================================================
 
+// BOT_TOKEN and SECRET_PASSWORD come from the .env file (see .env.example).
+// Never commit the real .env file. Variables that are already set in the
+// environment (for example by Docker) are not overwritten.
+try {
+  process.loadEnvFile(
+    join(fileURLToPath(new URL(".", import.meta.url)), ".env")
+  );
+} catch (error) {
+  if (error.code !== "ENOENT") throw error;
+}
+
 // Telegram bot token (from @BotFather).
-const BOT_TOKEN = "9026012194:AAEfT7ZGeCII_AIjdHM7iPqDVDq8dNPpe6o";
+const BOT_TOKEN = (process.env.BOT_TOKEN || "").trim();
 
 // Password every user types in Telegram after /start (12+ characters).
-const SECRET_PASSWORD = "UltraSecretPassword123!";
+const SECRET_PASSWORD = process.env.SECRET_PASSWORD || "";
 
 // First admin password for "/admin PASSWORD". It is stored as scrambled pieces,
 // so it is never readable in one line (obfuscation, not encryption). It is only
@@ -340,11 +351,23 @@ function validateConfiguration() {
     throw new Error("Please install Node.js 22 or newer.");
   }
 
+  if (!BOT_TOKEN) {
+    throw new Error(
+      "BOT_TOKEN is missing. Add it to the .env file (see .env.example)."
+    );
+  }
+
   if (!/^\d+:[A-Za-z0-9_-]+$/.test(BOT_TOKEN)) {
     throw new Error("BOT_TOKEN has an invalid format.");
   }
 
-  if (!SECRET_PASSWORD || SECRET_PASSWORD.length < 12) {
+  if (!SECRET_PASSWORD) {
+    throw new Error(
+      "SECRET_PASSWORD is missing. Add it to the .env file (see .env.example)."
+    );
+  }
+
+  if (SECRET_PASSWORD.length < 12) {
     throw new Error("SECRET_PASSWORD must be at least 12 characters.");
   }
 

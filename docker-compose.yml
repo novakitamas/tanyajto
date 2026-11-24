@@ -3,6 +3,8 @@ services:
     build: .
     container_name: toggle-bot
     restart: unless-stopped
+    env_file:
+      - .env
     environment:
       AUTH_DIR: /data
       TZ: Europe/Budapest

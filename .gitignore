@@ -3,3 +3,8 @@ toggle-bot-data.json
 toggle-bot-data.json.tmp
 toggle-bot.key
 node_modules/
+
+# Secrets (keep .env.example, it has no real values)
+.env
+.env.*
+!.env.example

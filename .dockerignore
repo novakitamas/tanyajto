@@ -2,6 +2,8 @@
 .gitignore
 node_modules
 npm-debug.log
+.env
+.env.*
 toggle-bot.key
 toggle-bot-data.json
 toggle-bot-data.json.tmp
