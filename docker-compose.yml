@@ -1,0 +1,13 @@
+services:
+  toggle-bot:
+    build: .
+    container_name: toggle-bot
+    restart: unless-stopped
+    environment:
+      AUTH_DIR: /data
+      TZ: Europe/Budapest
+    volumes:
+      - toggle-bot-data:/data
+
+volumes:
+  toggle-bot-data:

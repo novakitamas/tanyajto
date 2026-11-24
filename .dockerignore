@@ -1,0 +1,13 @@
+.git
+.gitignore
+node_modules
+npm-debug.log
+toggle-bot.key
+toggle-bot-data.json
+toggle-bot-data.json.tmp
+toggle-bot-auth.json
+encode-secret.mjs
+Dockerfile
+docker-compose.yml
+.dockerignore
+*.md
