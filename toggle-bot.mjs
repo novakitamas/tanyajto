@@ -34,6 +34,13 @@ const INITIAL_ADMIN_PASSWORD = revealSecret([
   "9ku1Hg==",
 ]);
 
+// The bot logs in to the website for new tokens only at these times
+// (24-hour clock, in TIMEZONE). The second time is a one-time retry for
+// accounts whose login failed at the first time.
+const TIMEZONE = "Europe/Budapest";
+const DAILY_LOGIN_TIME = "04:00";
+const RETRY_LOGIN_TIME = "06:00";
+
 // ============================================================
 
 // Optional: restrict access to specific numeric Telegram user IDs.
@@ -48,15 +55,28 @@ const PAGE_URL = `${SITE_ORIGIN}/dashboard/personnel-manager/gateways`;
 const TARGET_URL = `${PAGE_URL}?/toggle`;
 
 const COOKIE_NAME = "AuthorizationToken";
-const DEFAULT_TOKEN_LIFETIME_MS = 4 * 60 * 60 * 1000;
+// Website tokens last 30 days. Used when the website sends no expiry.
+const DEFAULT_TOKEN_LIFETIME_MS = 30 * 24 * 60 * 60 * 1000;
 const EXPIRY_MARGIN_MS = 60 * 1000;
-const RETRY_DELAY_MS = 60 * 1000;
-const BAD_PASSWORD_DELAY_MS = 60 * 60 * 1000;
+const SCHEDULER_TICK_MS = 30 * 1000;
 const PENDING_TIMEOUT_MS = 5 * 60 * 1000;
 const LOCKOUT_DURATION_MS = 5 * 60 * 1000;
 const MAX_PASSWORD_ATTEMPTS = 5;
 const TOGGLE_COOLDOWN_MS = 3000;
 const MAX_MESSAGE_AGE_SECONDS = 60;
+
+function parseClock(value, name) {
+  const match = /^(\d{1,2}):(\d{2})$/.exec(value);
+
+  if (!match || Number(match[1]) > 23 || Number(match[2]) > 59) {
+    throw new Error(`${name} must look like "04:00".`);
+  }
+
+  return Number(match[1]) * 60 + Number(match[2]);
+}
+
+const DAILY_MINUTES = parseClock(DAILY_LOGIN_TIME, "DAILY_LOGIN_TIME");
+const RETRY_MINUTES = parseClock(RETRY_LOGIN_TIME, "RETRY_LOGIN_TIME");
 
 const MENU = {
   keyboard: [[{ text: "toggle" }]],
@@ -75,11 +95,10 @@ const KNOWN_COMMANDS = new Set([
 const passwordAttempts = new Map();
 const adminAttempts = new Map();
 const pending = new Map(); // userId -> { type, username, startedAt }
-const accountSessions = new Map(); // account id -> { cookie, expiresAt }
-const accountBlockedUntil = new Map();
-const accountLogins = new Map();
+const wrongPasswordAccounts = new Set(); // account ids the website rejected
 
 let lastToggleAt = 0;
+let refreshing = false;
 let stopping = false;
 
 // Saved state. Passwords and tokens are stored encrypted (AES-256-GCM)
@@ -96,7 +115,9 @@ const data = {
   users: [],
   modes: {},
   userTokens: {},
+  // { id, username, password, token, tokenExpiresAt, refreshedOn }
   accounts: [],
+  schedule: { dailyOn: "", retryOn: "" },
   adminPasswordHash: "",
 };
 
@@ -188,6 +209,30 @@ function validIds(list) {
     : [];
 }
 
+// Current date (YYYY-MM-DD) and minutes since midnight in TIMEZONE.
+function localNow(timestamp = Date.now()) {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: TIMEZONE,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hourCycle: "h23",
+  }).formatToParts(new Date(timestamp));
+
+  const get = (type) => parts.find((p) => p.type === type).value;
+
+  return {
+    date: `${get("year")}-${get("month")}-${get("day")}`,
+    minutes: Number(get("hour")) * 60 + Number(get("minute")),
+  };
+}
+
+function hasValidToken(account, now = Date.now()) {
+  return Boolean(account.token) && account.tokenExpiresAt > now;
+}
+
 function loadData() {
   let stored = null;
 
@@ -225,12 +270,27 @@ function loadData() {
   data.adminPasswordHash =
     typeof stored.adminPasswordHash === "string" ? stored.adminPasswordHash : "";
 
-  data.accounts = (Array.isArray(stored.accounts) ? stored.accounts : []).filter(
-    (a) =>
-      typeof a?.id === "string" &&
-      typeof a?.username === "string" &&
-      typeof a?.password === "string"
-  );
+  data.accounts = (Array.isArray(stored.accounts) ? stored.accounts : [])
+    .filter(
+      (a) =>
+        typeof a?.id === "string" &&
+        typeof a?.username === "string" &&
+        typeof a?.password === "string"
+    )
+    .map((a) => ({
+      id: a.id,
+      username: a.username,
+      password: a.password,
+      token: typeof a.token === "string" ? a.token : "",
+      tokenExpiresAt: Number.isFinite(a.tokenExpiresAt) ? a.tokenExpiresAt : 0,
+      refreshedOn: typeof a.refreshedOn === "string" ? a.refreshedOn : "",
+    }));
+
+  const schedule = stored.schedule || {};
+  data.schedule = {
+    dailyOn: typeof schedule.dailyOn === "string" ? schedule.dailyOn : "",
+    retryOn: typeof schedule.retryOn === "string" ? schedule.retryOn : "",
+  };
 
   const usersValid = stored.usersFingerprint === usersFingerprint();
   data.users = usersValid ? validIds(stored.users) : [];
@@ -290,6 +350,16 @@ function validateConfiguration() {
 
   if (!ALLOWED_USER_IDS.every((id) => Number.isSafeInteger(id) && id > 0)) {
     throw new Error("ALLOWED_USER_IDS must contain numeric user IDs.");
+  }
+
+  if (RETRY_MINUTES <= DAILY_MINUTES) {
+    throw new Error("RETRY_LOGIN_TIME must be later than DAILY_LOGIN_TIME.");
+  }
+
+  try {
+    new Intl.DateTimeFormat("en-CA", { timeZone: TIMEZONE });
+  } catch {
+    throw new Error(`TIMEZONE "${TIMEZONE}" is not a valid timezone name.`);
   }
 }
 
@@ -417,6 +487,12 @@ function deleteMessageQuietly(chatId, messageId) {
   );
 }
 
+async function notifyAdmins(text) {
+  for (const adminId of [...data.admins]) {
+    await quietly(sendMessage(adminId, text));
+  }
+}
+
 function describeUser(from) {
   const name =
     [from.first_name, from.last_name].filter(Boolean).join(" ") || "Unknown";
@@ -526,63 +602,107 @@ async function loginToSite(username, password) {
   }
 }
 
-// Logs in with a saved account (one attempt, shared between callers).
-function loginAccount(account) {
-  const blockedUntil = accountBlockedUntil.get(account.id) || 0;
+// Logs in with a saved account and stores the new token (encrypted).
+// Only the scheduled refresh calls this.
+async function refreshAccount(accountId, date) {
+  const account = data.accounts.find((a) => a.id === accountId);
 
-  if (blockedUntil > Date.now()) {
-    const seconds = Math.ceil((blockedUntil - Date.now()) / 1000);
+  if (!account) return { ok: false, message: "The account no longer exists." };
 
-    return Promise.resolve({
-      ok: false,
-      message: `The last website login failed. Next attempt possible in ${seconds} seconds.`,
-    });
+  const password = safeDecrypt(account.password);
+
+  if (password === null) {
+    return { ok: false, message: "The saved password could not be decrypted." };
   }
 
-  if (accountLogins.has(account.id)) return accountLogins.get(account.id);
+  const result = await loginToSite(account.username, password);
 
-  const promise = (async () => {
-    const password = safeDecrypt(account.password);
-
-    if (password === null) {
-      return {
-        ok: false,
-        message: "The saved account could not be decrypted. Re-add it with /accounts.",
-      };
-    }
-
-    const result = await loginToSite(account.username, password);
-
-    if (result.ok) {
-      accountBlockedUntil.delete(account.id);
-      accountSessions.set(account.id, {
-        cookie: result.cookie.value,
-        expiresAt: result.cookie.expiresAt,
-      });
-
-      return { ok: true, cookie: result.cookie.value };
-    }
-
-    accountBlockedUntil.set(
-      account.id,
-      Date.now() + (result.wrongCredentials ? BAD_PASSWORD_DELAY_MS : RETRY_DELAY_MS)
-    );
-
+  if (!result.ok) {
+    if (result.wrongCredentials) wrongPasswordAccounts.add(accountId);
     return { ok: false, message: result.message };
-  })().finally(() => accountLogins.delete(account.id));
+  }
 
-  accountLogins.set(account.id, promise);
-  return promise;
+  wrongPasswordAccounts.delete(accountId);
+
+  const saved = mutate((d) => {
+    const target = d.accounts.find((a) => a.id === accountId);
+
+    if (target) {
+      target.token = encryptText(result.cookie.value);
+      target.tokenExpiresAt = result.cookie.expiresAt;
+      target.refreshedOn = date;
+    }
+  });
+
+  return saved
+    ? { ok: true }
+    : { ok: false, message: "The new token could not be saved." };
 }
 
-async function ensureAccountCookie(account) {
-  const cached = accountSessions.get(account.id);
+// Runs at most once per slot per day: the daily time, then the retry time
+// (retry only for accounts that did not get a new token today).
+async function runScheduledLogins(timestamp = Date.now()) {
+  if (refreshing || data.accounts.length === 0) return;
 
-  if (cached && cached.expiresAt > Date.now() + 30 * 1000) {
-    return { ok: true, cookie: cached.cookie };
+  const { date, minutes } = localNow(timestamp);
+
+  if (minutes < DAILY_MINUTES) return;
+
+  let mode = null;
+
+  if (data.schedule.dailyOn !== date) {
+    mode = "daily";
+  } else if (minutes >= RETRY_MINUTES && data.schedule.retryOn !== date) {
+    mode = "retry";
   }
 
-  return loginAccount(account);
+  if (!mode) return;
+
+  refreshing = true;
+
+  try {
+    // Mark the slot first so a crash can never cause a login loop.
+    const marked = mutate((d) => {
+      if (mode === "daily") {
+        d.schedule.dailyOn = date;
+        if (minutes >= RETRY_MINUTES) d.schedule.retryOn = date;
+      } else {
+        d.schedule.retryOn = date;
+      }
+    });
+
+    if (!marked) {
+      console.error("Could not save the schedule state. Skipping this run.");
+      return;
+    }
+
+    const targets = data.accounts.filter(
+      (a) =>
+        mode === "daily" ||
+        (a.refreshedOn !== date && !wrongPasswordAccounts.has(a.id))
+    );
+
+    const failed = [];
+
+    for (const account of targets) {
+      const result = await refreshAccount(account.id, date);
+
+      if (!result.ok) failed.push(`- ${account.username}: ${result.message}`);
+    }
+
+    const fallbackDone = mode === "retry" || minutes >= RETRY_MINUTES;
+
+    if (failed.length > 0 && fallbackDone) {
+      await notifyAdmins(
+        "The scheduled website login failed for:\n" +
+          failed.join("\n") +
+          `\n\nOld tokens keep working until they expire. Next attempt: ` +
+          `${DAILY_LOGIN_TIME}.`
+      );
+    }
+  } finally {
+    refreshing = false;
+  }
 }
 
 // Returns { text, sessionInvalid }. A toggle is never retried automatically.
@@ -697,6 +817,49 @@ async function sendToggleRequest(cookie) {
   }
 }
 
+// Tries the saved accounts in order. It moves on to the next account only
+// when the website clearly says the toggle was NOT performed (rejected
+// token). Any other outcome stops here, so a toggle is never done twice.
+async function toggleWithAccounts() {
+  for (let i = 0; i < data.accounts.length; i++) {
+    const account = data.accounts[i];
+
+    if (!hasValidToken(account)) continue;
+
+    const token = safeDecrypt(account.token);
+
+    if (!token) continue;
+
+    const result = await sendToggleRequest(token);
+
+    if (result.sessionInvalid) {
+      mutate((d) => {
+        const target = d.accounts.find((a) => a.id === account.id);
+
+        if (target) {
+          target.token = "";
+          target.tokenExpiresAt = 0;
+          target.refreshedOn = "";
+        }
+      });
+      continue;
+    }
+
+    return {
+      label: i === 0 ? "account" : `backup account ${i + 1}`,
+      text: result.text,
+    };
+  }
+
+  return {
+    label: "",
+    text:
+      "No website account has a working token right now. The toggle was not " +
+      `performed. Tokens are renewed daily at ${DAILY_LOGIN_TIME} ` +
+      `(retry at ${RETRY_LOGIN_TIME}). An admin can check /accounts.`,
+  };
+}
+
 // ---------------------------------------------------------------
 // Accounts view (usernames only, never passwords)
 // ---------------------------------------------------------------
@@ -711,9 +874,14 @@ function buildAccountsView() {
   const text = count
     ? `Website accounts (${count}):\n` +
       data.accounts
-        .map((a, i) => `${i + 1}. ${a.username}${i === 0 ? " (default)" : ""}`)
+        .map(
+          (a, i) =>
+            `${i + 1}. ${a.username}${i === 0 ? " (default)" : ""}` +
+            `${hasValidToken(a) ? "" : " - no valid token"}`
+        )
         .join("\n") +
-      "\n\nThe first account is used by default."
+      "\n\nThe first account is used first. If its token is rejected, the " +
+      "next accounts are tried in order."
     : "No website accounts yet. Add one with the button below.";
 
   const rows = data.accounts.map((a) => [
@@ -764,7 +932,14 @@ async function addAccount(chatId, username, password) {
 
   const id = randomBytes(4).toString("hex");
   const saved = mutate((d) => {
-    d.accounts.push({ id, username, password: encryptText(password) });
+    d.accounts.push({
+      id,
+      username,
+      password: encryptText(password),
+      token: encryptText(result.cookie.value),
+      tokenExpiresAt: result.cookie.expiresAt,
+      refreshedOn: localNow().date,
+    });
   });
 
   if (!saved) {
@@ -775,12 +950,7 @@ async function addAccount(chatId, username, password) {
     return;
   }
 
-  accountSessions.set(id, {
-    cookie: result.cookie.value,
-    expiresAt: result.cookie.expiresAt,
-  });
-
-  await sendMessage(chatId, `Account "${username}" added.`);
+  await sendMessage(chatId, `Account "${username}" added and its token saved.`);
   await sendAccountsView(chatId);
 }
 
@@ -876,10 +1046,7 @@ async function handleCallback(query) {
     d.accounts = d.accounts.filter((a) => a.id !== account.id);
   });
 
-  if (removed) {
-    accountSessions.delete(account.id);
-    accountBlockedUntil.delete(account.id);
-  }
+  if (removed) wrongPasswordAccounts.delete(account.id);
 
   await answer(removed ? "Deleted." : "Could not save the change.");
   await showList();
@@ -1024,7 +1191,7 @@ async function handleSecretPassword(message, text, now) {
 
   await sendMessage(
     chatId,
-    "Authenticated. Your login does not expire. Use toggle below. ",
+    "Authenticated. Your login does not expire. Use toggle below.",
     MENU
   );
 }
@@ -1125,14 +1292,9 @@ async function handleToggle(chatId, userId, now) {
 
   lastToggleAt = now;
 
-  let cookie;
-  let label;
-  let account = null;
-
   if (data.modes[String(userId)] === "token") {
     const encrypted = data.userTokens[String(userId)];
-    cookie = encrypted ? safeDecrypt(encrypted) : null;
-    label = "your token";
+    const cookie = encrypted ? safeDecrypt(encrypted) : null;
 
     if (!cookie) {
       await sendMessage(
@@ -1142,60 +1304,40 @@ async function handleToggle(chatId, userId, now) {
       );
       return;
     }
-  } else {
-    account = data.accounts[0];
-    label = "account";
 
-    if (!account) {
-      await sendMessage(
-        chatId,
-        "No website account is configured yet. An admin must add one with /accounts.",
-        MENU
-      );
-      return;
-    }
+    const result = await sendToggleRequest(cookie);
 
-    const login = await ensureAccountCookie(account);
-
-    if (!login.ok) {
-      await sendMessage(
-        chatId,
-        `Could not log in to the website. ${login.message} The toggle was not performed.`,
-        MENU
-      );
-      return;
-    }
-
-    cookie = login.cookie;
-  }
-
-  const result = await sendToggleRequest(cookie);
-
-  if (result.sessionInvalid) {
-    if (account) {
-      accountSessions.delete(account.id);
-      const fresh = await loginAccount(account);
-
-      await sendMessage(
-        chatId,
-        fresh.ok
-          ? `${result.text} A new login was fetched. Press toggle again.`
-          : `${result.text} ${fresh.message}`,
-        MENU
-      );
-    } else {
+    if (result.sessionInvalid) {
       await sendMessage(
         chatId,
         `${result.text} Send /token NEW_TOKEN to replace it, or /switch to use the website account.`,
         MENU
       );
+      return;
     }
 
+    // If this reply fails, do NOT repeat the website request.
+    await sendMessage(chatId, `(your token) ${result.text}`, MENU);
     return;
   }
 
+  if (data.accounts.length === 0) {
+    await sendMessage(
+      chatId,
+      "No website account is configured yet. An admin must add one with /accounts.",
+      MENU
+    );
+    return;
+  }
+
+  const outcome = await toggleWithAccounts();
+
   // If this reply fails, do NOT repeat the website request.
-  await sendMessage(chatId, `(${label}) ${result.text}`, MENU);
+  await sendMessage(
+    chatId,
+    outcome.label ? `(${outcome.label}) ${outcome.text}` : outcome.text,
+    MENU
+  );
 }
 
 function parseCommand(text) {
@@ -1498,10 +1640,23 @@ async function main() {
 
   console.log(`Bot @${bot.username} is running.`);
   console.log("Open its private chat and send /start.");
+  console.log(
+    `Website logins: daily at ${DAILY_LOGIN_TIME}, retry at ${RETRY_LOGIN_TIME} (${TIMEZONE}).`
+  );
   console.log("Keep this terminal open. Press Ctrl+C to stop.");
+
+  const runSchedule = () =>
+    runScheduledLogins().catch(() => {
+      console.error("The scheduled website login run failed.");
+    });
+
+  const scheduler = setInterval(runSchedule, SCHEDULER_TICK_MS);
+  scheduler.unref();
+  runSchedule();
 
   function stop() {
     stopping = true;
+    clearInterval(scheduler);
     console.log("Stopping after the current request finishes...");
   }
 
@@ -1563,7 +1718,7 @@ async function main() {
   }
 }
 
-export { initialize, handleMessage, handleCallback, data };
+export { initialize, handleMessage, handleCallback, runScheduledLogins, data };
 export const testHooks = {
   resetCooldown() {
     lastToggleAt = 0;
